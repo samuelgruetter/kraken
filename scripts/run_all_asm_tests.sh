@@ -8,8 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ASM_TESTS_DIR="$SCRIPT_DIR/../asm-tests"
 KRAKEN_ROOT="$SCRIPT_DIR/.."
 
-cd "$KRAKEN_ROOT"
-lake build krakentest
+(cd "$KRAKEN_ROOT" && lake build krakentest)
 
 PASSED=0
 FAILED=0

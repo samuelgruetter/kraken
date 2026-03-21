@@ -11,6 +11,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KRAKEN_ROOT="$SCRIPT_DIR/.."
 
+(cd "$KRAKEN_ROOT" && lake build krakentest)
+
 # List of C tests to run
 C_TESTS=(insertionsort)
 
@@ -29,13 +31,8 @@ for TEST in "${C_TESTS[@]}"; do
     MKEXE="$KRAKEN_ROOT/.lake/build/bin/mkc${TEST}test"
     INSTRUMENTED="$KRAKEN_ROOT/c-tests/${TEST}_tests_instrumented.s"
 
-    if [ ! -x "$MKEXE" ]; then
-        echo "Error: $MKEXE not found. Run 'lake build mkc${TEST}test' first."
-        exit 1
-    fi
-
     echo "--- Generating instrumented assembly ---"
-    (cd "$KRAKEN_ROOT" && "$MKEXE")
+    (cd "$KRAKEN_ROOT" && lake build mkc${TEST}test && "$MKEXE")
 
     echo "--- Running krakentest ---"
     "$SCRIPT_DIR/run_asm_test.sh" "$INSTRUMENTED"
