@@ -692,7 +692,8 @@ private def parsePreambleLine : Parser FileLine := do
     | _ => pure .skip
   else
     -- Identifier line: try to recognise as label (possibly with .quad value).
-    -- Never calls parseInstr — compiler-generated code before _start is not our concern.
+    -- Never calls parseInstr — this function is only used outside .text sections,
+    -- where lines are data declarations or directives, not executable instructions.
     attempt (do
       let name ← parseName
       skipHWs
