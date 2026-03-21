@@ -260,6 +260,10 @@ def parseCondCode (suffix : String) : Except String CondCode :=
   | "ae" | "nc" | "nb" => .ok .ae
   | "a" | "nbe" => .ok .a
   | "be" | "na" => .ok .be
+  | "l" | "nge" => .ok .l
+  | "ge" | "nl" => .ok .ge
+  | "le" | "ng" => .ok .le
+  | "g" | "nle" => .ok .g
   | _ => .error s!"unknown condition code: {suffix}"
 
 -- ============================================================================
@@ -344,7 +348,7 @@ def parseInstr : Parser Instr := do
     checkNoTwoMemory src dst
     pure (.movl dst src)
   | "lea" | "leaq" => do
-    let src ← parseMemory; parseComma
+    let src ← attempt parseRIPRel <|> parseMemory; parseComma
     let dst ← parseReg64
     pure (.lea dst src)
 
@@ -504,11 +508,18 @@ def parseInstr : Parser Instr := do
   | "ret" | "retq" =>
     pure .ret
 
-  -- Control flow - unconditional jump
+  -- Control flow - call and unconditional jump
+  | "call" | "callq" => do
+    skipHWs
+    let target ← parseName
+    pure (.call target)
   | "jmp" | "jmpq" => do
     skipHWs
     let target ← parseName
     pure (.jmp target)
+
+  -- Intel CET no-op
+  | "endbr64" => pure .endbr64
 
   -- Control flow - conditional jumps
   | _ =>
@@ -600,12 +611,22 @@ instance : Inhabited ProgramWithDataSection where
 private inductive FileLine
   | sectionData
   | sectionText
-  | dataEntry (label : String) (value : UInt64)
+  | sectionOther                               -- .section other-than-.text/.data
+  | dataEntry  (label : String) (value : UInt64)
+  | quadValue  (value : UInt64)                -- standalone .quad N
   | labelOnly  (name  : String)
   | instr      (lbl   : Option Label) (i : Instr)
   | skip
 
-/-- Parse one line of a full assembly file (without consuming the trailing newline). -/
+/-- Parse a .quad value: either a numeric literal or a symbolic reference.
+    Returns the numeric value, or .skip for symbolic references we can't resolve. -/
+private def parseQuadLine (label : String) : Parser FileLine := do
+  skipHWs
+  (do let v ← parseInt; pure (.dataEntry label (UInt64.ofInt v))) <|>
+  (do let _ ← parseName; pure .skip)          -- symbolic ref: not resolvable statically
+
+/-- Parse one line of a full assembly file in collecting (text) mode.
+    Used between the first .text section and jmp _kraken_capture. -/
 private def parseFileLine : Parser FileLine := do
   skipHWs
   let c ← peek!
@@ -613,14 +634,20 @@ private def parseFileLine : Parser FileLine := do
     if c == '#' then skipLineComment
     pure .skip
   else if c == '.' then
-    -- Directive line: .data, .text, .align, .globl, .quad, etc.
     let name ← parseName
+    -- Check for local label (e.g. .L1:, .LFB0:) before matching directives
+    let c2 ← peek!
+    if c2 == ':' then do
+      let _ ← pchar ':'
+      pure (.labelOnly name)
+    else
     match name with
-    | ".data" => pure .sectionData
-    | ".text" => pure .sectionText
+    | ".data"    => pure .sectionData
+    | ".text"    => pure .sectionText
+    | ".section" => pure .sectionOther
+    | ".quad"    => do let v ← parseInt; pure (.quadValue (UInt64.ofInt v))
     | _ => pure .skip
   else
-    -- Starts with an identifier: either "label:" or a bare instruction mnemonic.
     attempt (do
       let name ← parseName
       skipHWs
@@ -630,14 +657,10 @@ private def parseFileLine : Parser FileLine := do
       if c2 == '\n' || c2 == '#' then
         pure (.labelOnly name)
       else if c2 == '.' then
-        -- Could be ".quad N" (data entry) or another directive.
         let directive ← parseName
         skipHWs
-        if directive == ".quad" then
-          let v ← parseInt
-          pure (.dataEntry name v.toNat.toUInt64)
-        else
-          pure (.labelOnly name)
+        if directive == ".quad" then parseQuadLine name
+        else pure (.labelOnly name)
       else
         let i ← parseInstr
         pure (.instr (some name) i)
@@ -646,42 +669,113 @@ private def parseFileLine : Parser FileLine := do
       pure (.instr none i)
     )
 
+/-- Parse one line of a full assembly file in preamble (non-text) mode.
+    Used outside .text sections: only looks for section markers and data entries;
+    never invokes parseInstr, so unsupported instructions in compiler-generated
+    preamble code do not cause errors. -/
+private def parsePreambleLine : Parser FileLine := do
+  skipHWs
+  let c ← peek!
+  if c == '\n' || c == '#' then
+    if c == '#' then skipLineComment
+    pure .skip
+  else if c == '.' then
+    let name ← parseName
+    match name with
+    | ".data"    => pure .sectionData
+    | ".text"    => pure .sectionText
+    | ".section" => pure .sectionOther
+    | ".quad"    =>
+        skipHWs
+        (do let v ← parseInt; pure (.quadValue (UInt64.ofInt v))) <|>
+        (do let _ ← parseName; pure .skip)    -- symbolic ref: skip
+    | _ => pure .skip
+  else
+    -- Identifier line: try to recognise as label (possibly with .quad value).
+    -- Never calls parseInstr — compiler-generated code before _start is not our concern.
+    attempt (do
+      let name ← parseName
+      skipHWs
+      let _ ← pchar ':'
+      skipHWs
+      let c2 ← peek!
+      if c2 == '\n' || c2 == '#' then
+        pure (.labelOnly name)
+      else if c2 == '.' then
+        let directive ← parseName
+        skipHWs
+        if directive == ".quad" then parseQuadLine name
+        else pure (.labelOnly name)
+      else
+        pure .skip                             -- content after label: not a data entry
+    ) <|>
+    pure .skip                                 -- unrecognised non-directive line: skip
+
 private structure FileParseState where
-  inData               : Bool := false
-  inText               : Bool := false
-  collecting           : Bool := false
-  sawKrakenCaptureJmp  : Bool := false
-  dataAcc              : List (String × UInt64) := []
-  instrAcc             : Program := []
+  inData              : Bool := false
+  inText              : Bool := false          -- true = collecting text instructions
+  sawKrakenCaptureJmp : Bool := false
+  pendingDataLabel    : Option String := none  -- label seen before standalone .quad N
+  pendingTextLabel    : Option Label  := none  -- label seen before next instruction
+  dataAcc             : List (String × UInt64) := []
+  instrAcc            : Program := []
 
 private partial def parseProgramWithDataAux (st : FileParseState) : Parser ProgramWithDataSection := do
   let done ← (eof *> pure true) <|> pure false
   if done || st.sawKrakenCaptureJmp then
     pure { prog := st.instrAcc, dataLabels := st.dataAcc }
   else
-    let line ← parseFileLine
+    -- Use instruction-aware parsing only while collecting text; elsewhere use
+    -- the lightweight preamble parser that never calls parseInstr.
+    let line ← if st.inText then parseFileLine else parsePreambleLine
     skipToEndOfLine
     let st' :=
       match line with
-      | .sectionData => { st with inData := true, inText := false }
-      | .sectionText => { st with inData := false, inText := true }
+      | .sectionData =>
+          { st with inData := true, inText := false, pendingDataLabel := none }
+      | .sectionText =>
+          { st with inData := false, inText := true, pendingDataLabel := none }
+      | .sectionOther =>
+          { st with inData := false, inText := false, pendingDataLabel := none }
       | .dataEntry lbl val =>
-          if st.inData then { st with dataAcc := st.dataAcc ++ [(lbl, val)] }
+          if st.inData then
+            { st with dataAcc := st.dataAcc ++ [(lbl, val)], pendingDataLabel := none }
           else st
-      | .labelOnly "_start" =>
-          if st.inText then { st with collecting := true } else st
-      | .labelOnly _ => st
+      | .quadValue val =>
+          if st.inData then
+            -- First quad after a label-only line carries the pending label;
+            -- subsequent quads in the same block are stored with an empty label
+            -- so they occupy consecutive memory addresses without a named entry.
+            let lbl := st.pendingDataLabel.getD ""
+            { st with dataAcc := st.dataAcc ++ [(lbl, val)], pendingDataLabel := none }
+          else st
+      | .labelOnly name =>
+          if st.inData then { st with pendingDataLabel := some name }
+          else if st.inText then
+            match st.pendingTextLabel with
+            | none      => { st with pendingTextLabel := some name }
+            | some prev =>
+                -- Consecutive labels (e.g. insertionsort: then .LFB0:): emit a no-op
+                -- for the first label so it gets its own address, keep new label pending.
+                { st with instrAcc := st.instrAcc ++ [(some prev, .endbr64)],
+                          pendingTextLabel := some name }
+          else st
       | .instr _ (.jmp "_kraken_capture") =>
           { st with sawKrakenCaptureJmp := true }
       | .instr lbl i =>
-          if st.collecting then { st with instrAcc := st.instrAcc ++ [(lbl, i)] }
+          if st.inText then
+            -- Attach any pending text label (from a preceding label-only line)
+            -- in preference to an inline label on the same line.
+            let effectiveLbl := st.pendingTextLabel <|> lbl
+            { st with instrAcc := st.instrAcc ++ [(effectiveLbl, i)],
+                      pendingTextLabel := none }
           else st
       | .skip => st
     parseProgramWithDataAux st'
 
-/-- Parse a complete assembly file into a ProgramWithDataSection,
-    collecting data labels from the .data section and instructions
-    from between _start: and jmp _kraken_capture. -/
+/-- Parse a complete assembly file into a ProgramWithDataSection.
+    Collects data labels from all .data sections and instructions from
+    all .text sections (up to jmp _kraken_capture). -/
 def parseProgramWithData : Parser ProgramWithDataSection :=
   parseProgramWithDataAux {}
 

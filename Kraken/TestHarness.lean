@@ -321,7 +321,7 @@ def buildMachineStateWithData (pwds : Kraken.Parser.ProgramWithDataSection) : Ma
   let (mem', lbls', _) := pwds.dataLabels.foldl (fun (m, a, off) (lbl, val) =>
     let addr := dataBase + off.toUInt64
     let m' := m.insert addr (.data val)
-    let a' := a.insert lbl addr
+    let a' := if lbl.isEmpty then a else a.insert lbl addr
     (m', a', off + 8)
   ) (s.memory, s.labelAddrs, 0)
   { s with memory := mem', labelAddrs := lbls' }
@@ -333,6 +333,9 @@ def runKraken (asmCode : String) (initState : MachineState := {})
     : Except String MachineState := do
   let pwds ← Kraken.Parser.parse asmCode
   let s := buildMachineStateWithData pwds
+  -- Set rip to _start label (insertionsort may appear before _start in .text)
+  let startRip := s.labelAddrs["_start"]?.getD 0
+  let s := { s with rip := startRip }
   -- Overlay any caller-supplied initial register/flag state
   let s := { s with regs := initState.regs, flags := initState.flags }
   runBounded s 10000
@@ -402,7 +405,43 @@ def runTest (asmCode : String) (asOutput : ByteArray) : TestResult :=
     -- Pass full assembly to runKraken; it handles extraction and data-label parsing internally
     match runKraken asmCode with
     | .error e => .krakenError e
-    | .ok krakenState => compareStates krakenState actualRegs actualFlags
+    | .ok krakenState =>
+      let memData := parseMemoryRegions asOutput
+      if memData.isEmpty then
+        -- No memory regions: compare registers and flags directly.
+        compareStates krakenState actualRegs actualFlags
+      else
+        -- Memory regions present (C-code test): compare only memory content.
+        -- Pointer-valued registers differ between Kraken's abstract address model and
+        -- real x86 virtual addresses, so register comparison is not meaningful here.
+        -- Instead, compare the sorted data values stored in Kraken's data region
+        -- against the actual sorted values captured from the real execution.
+        let allActualValues : Array UInt64 := (memData.map Prod.snd).foldl Array.append #[]
+        let n := allActualValues.size
+        -- Find the base address of the program's data region: the minimum address
+        -- among non-harness labels that point to a data cell (not an instruction).
+        -- The _kraken_* harness labels occupy the first part of the data section;
+        -- the program's own data labels (e.g. test_array) follow.
+        -- Note: labelAddrs has no generic fold; we use a for-in loop via Id.run.
+        let programBase : UInt64 := Id.run do
+          let mut best : UInt64 := (0 : UInt64) - 1
+          for (name, addr) in krakenState.labelAddrs do
+            if !name.startsWith "_kraken_" && addr < best then
+              match krakenState.memory[addr]? with
+              | some (MemCell.data _) => best := addr
+              | _ => ()
+          return best
+        if programBase == (0 : UInt64) - 1 then
+          .krakenError "Kraken memory has no program-data labels after execution"
+        else
+          let krakenValues := Array.ofFn (n := n) fun i =>
+            (readDataCell krakenState.memory (programBase + (i.val * 8).toUInt64)).getD 0
+          let diffs := (krakenValues.toList.zip allActualValues.toList).zipIdx.filterMap
+            fun ((exp, act), i) =>
+              if exp != act then some s!"mem[{i}]: expected {exp}, got {act}"
+              else none
+          if diffs.isEmpty then .success
+          else .mismatch diffs
 
 /-- Format a TestResult for display. -/
 def TestResult.toString : TestResult → String

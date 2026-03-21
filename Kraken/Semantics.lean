@@ -109,6 +109,7 @@ deriving Repr
 -- Flags
 structure Flags where
   zf : Bool := false -- Zero Flag
+  sf : Bool := false -- Sign Flag (MSB of result)
   of : Bool := false -- Overflow Flag
   cf : Bool := false -- Carry Flag
 deriving Repr, BEq
@@ -152,6 +153,10 @@ inductive CondCode
 | b    -- Below/Carry (CF=1)
 | ae   -- Above or Equal (CF=0)
 | a    -- Above (CF=0 ∧ ZF=0)
+| l    -- Less (SF≠OF)
+| ge   -- Greater or Equal (SF=OF)
+| le   -- Less or Equal (ZF=1 ∨ SF≠OF)
+| g    -- Greater (ZF=0 ∧ SF=OF)
 | be   -- Below or Equal (CF=1 ∨ ZF=1)
 deriving Repr, BEq, DecidableEq
 
@@ -242,6 +247,7 @@ inductive Instr
 
   -- Control flow
   | jmp (target : Label)                       -- Unconditional jump
+  | call (target : Label)                      -- call: push return addr, jump
   | ret                                        -- Return from function
   -- Conditional jump: jcc (condition code, target)
   -- Mapping from AT&T syntax to CondCode:
@@ -258,10 +264,13 @@ inductive Instr
   --   ja      .a         Above (unsigned)   CF=0 ∧ ZF=0
   --   jbe     .be        Below/Equal        CF=1 ∨ ZF=1
   | jcc (cc : CondCode) (target : Label)
+
+  -- x86 CET instruction; no-op for Kraken's purposes
+  | endbr64
   deriving Repr
 
 def Instr.is_ctrl
-  | Instr.jmp _ | Instr.jcc _ _ | Instr.ret => true
+  | Instr.jmp _ | Instr.call _ | Instr.jcc _ _ | Instr.ret => true
   | _ => false
 
 -- ============================================================================
@@ -630,15 +639,17 @@ def strt1 [Throw α] (s : MachineState) (i : Instr) (ret: MachineState → α): 
       eval_operand s src (fun src_v =>
       eval_reg_or_mem s dst (fun dst_v =>
       let (result64, zf, cf, of) := add_with_carry dst_v src_v 0
+      let sf := result64.toInt64 < 0
       set_reg_or_mem s dst result64 (fun s =>
-      ret { s with flags := { zf, of, cf }})))
+      ret { s with flags := { zf, sf, of, cf }})))
 
   | .adc dst src =>
       eval_operand s src (fun src_v =>
       eval_reg_or_mem s dst (fun dst_v =>
       let (result64, zf, cf, of) := add_with_carry dst_v src_v s.flags.cf.toNat
+      let sf := result64.toInt64 < 0
       set_reg_or_mem s dst result64 (fun s =>
-      ret { s with flags := { zf, of, cf }})))
+      ret { s with flags := { zf, sf, of, cf }})))
 
   | .adcx dst src =>
       -- Some thoughts: I basically try to assert the well-formedness of
@@ -672,16 +683,18 @@ def strt1 [Throw α] (s : MachineState) (i : Instr) (ret: MachineState → α): 
       eval_operand s src (fun src_v =>
       eval_reg_or_mem s dst (fun dst_v =>
       let (result64, zf, cf, of) := sub_with_borrow dst_v src_v 0
+      let sf := result64.toInt64 < 0
       set_reg_or_mem s dst result64 (fun s =>
-      ret { s with flags := { zf, of, cf }})))
+      ret { s with flags := { zf, sf, of, cf }})))
 
   | .sbb dst src =>
       -- Per Intel SDM: OF, SF, ZF, AF, PF, and CF flags are set according to the result
       eval_operand s src (fun src_v =>
       eval_reg_or_mem s dst (fun dst_v =>
       let (result64, zf, cf, of) := sub_with_borrow dst_v src_v s.flags.cf.toNat
+      let sf := result64.toInt64 < 0
       set_reg_or_mem s dst result64 (fun s =>
-      ret { s with flags := { zf, of, cf }})))
+      ret { s with flags := { zf, sf, of, cf }})))
 
   | .mul src =>
       -- mulq (64-bit only): RDX:RAX = RAX * src
@@ -730,20 +743,22 @@ def strt1 [Throw α] (s : MachineState) (i : Instr) (ret: MachineState → α): 
       -- Two's complement negation: negate via Int64 to ensure correct wrapping
       let result := (-(dst_v.toInt64)).toUInt64
       let zf := result == 0
+      let sf := result.toInt64 < 0
       let cf := dst_v != 0  -- CF is set unless operand is 0
       let of := dst_v == 0x8000000000000000  -- OF set when negating INT64_MIN
       set_reg_or_mem s dst result (fun s =>
-      ret { s with flags := { s.flags with zf, cf, of }}))
+      ret { s with flags := { s.flags with zf, sf, cf, of }}))
 
   | .dec dst =>
       eval_reg_or_mem s dst (fun dst_v =>
       let result := dst_v - 1
       let zf := result == 0
+      let sf := result.toInt64 < 0
       -- Signed overflow occurs when decrementing INT64_MIN (produces positive result)
       let of := dst_v == 0x8000000000000000
       -- dec does NOT affect CF
       set_reg_or_mem s dst result (fun s =>
-      ret { s with flags := { s.flags with zf, of }}))
+      ret { s with flags := { s.flags with zf, sf, of }}))
 
   | .lea dst src =>
       -- lea computes effective address, doesn't access memory
@@ -754,34 +769,39 @@ def strt1 [Throw α] (s : MachineState) (i : Instr) (ret: MachineState → α): 
       eval_reg_or_mem s dst (fun dst_v =>
       let result := dst_v ^^^ src_v
       let zf := result == 0
+      let sf := result.toInt64 < 0
       -- xor clears CF and OF
       set_reg_or_mem s dst result (fun s =>
-      ret { s with flags := { zf, of := false, cf := false }})))
+      ret { s with flags := { zf, sf, of := false, cf := false }})))
 
   | .and dst src =>
       eval_operand s src (fun src_v =>
       eval_reg_or_mem s dst (fun dst_v =>
       let result := dst_v &&& src_v
       let zf := result == 0
+      let sf := result.toInt64 < 0
       set_reg_or_mem s dst result (fun s =>
-      ret { s with flags := { zf, of := false, cf := false }})))
+      ret { s with flags := { zf, sf, of := false, cf := false }})))
 
   | .or dst src =>
       eval_operand s src (fun src_v =>
       eval_reg_or_mem s dst (fun dst_v =>
       let result := dst_v ||| src_v
       let zf := result == 0
+      let sf := result.toInt64 < 0
       set_reg_or_mem s dst result (fun s =>
-      ret { s with flags := { zf, of := false, cf := false }})))
+      ret { s with flags := { zf, sf, of := false, cf := false }})))
 
   | .cmp a b =>
       eval_reg_or_mem s a (fun a_v =>
       eval_operand s b (fun b_v =>
       let res := (Int.ofNat a_v.toNat) - (Int.ofNat b_v.toNat)
+      let result64 := UInt64.ofInt res
       let cf := res < 0
       let zf := res == 0
       let of := sub_overflow a_v b_v
-      ret { s with flags := { zf, of, cf }}))
+      let sf := result64.toInt64 < 0
+      ret { s with flags := { zf, sf, of, cf }}))
 
   -- ============================================================================
   -- 32-bit arithmetic operations (zero-extend results to 64-bit)
@@ -1036,7 +1056,8 @@ def strt1 [Throw α] (s : MachineState) (i : Instr) (ret: MachineState → α): 
       eval_operand s b (fun b_v =>
       let result := a_v &&& b_v
       let zf := result == 0
-      ret { s with flags := { zf, of := false, cf := false }}))
+      let sf := result.toInt64 < 0
+      ret { s with flags := { zf, sf, of := false, cf := false }}))
 
   | .cmpl a b =>
       eval_reg_or_mem s a (fun a_v =>
@@ -1044,9 +1065,11 @@ def strt1 [Throw α] (s : MachineState) (i : Instr) (ret: MachineState → α): 
       let a32 := mask32 a_v
       let b32 := mask32 b_v
       let res := (Int.ofNat a32.toNat) - (Int.ofNat b32.toNat)
+      let result32 := UInt64.ofInt res
       let cf := res < 0
       let zf := res == 0
-      ret { s with flags := { zf, cf, of := false }}))
+      let sf := (result32 &&& 0x80000000) != 0
+      ret { s with flags := { zf, sf, of := false, cf }}))
 
   | .cmpb a b =>
       eval_reg_or_mem s a (fun a_v =>
@@ -1054,9 +1077,11 @@ def strt1 [Throw α] (s : MachineState) (i : Instr) (ret: MachineState → α): 
       let a8 := mask8 a_v
       let b8 := mask8 b_v
       let res := (Int.ofNat a8.toNat) - (Int.ofNat b8.toNat)
+      let result8 := UInt64.ofInt res
       let cf := res < 0
       let zf := res == 0
-      ret { s with flags := { zf, cf, of := false }}))
+      let sf := (result8 &&& 0x80) != 0
+      ret { s with flags := { zf, sf, of := false, cf }}))
 
   -- ============================================================================
   -- Set byte on condition
@@ -1104,12 +1129,7 @@ def strt1 [Throw α] (s : MachineState) (i : Instr) (ret: MachineState → α): 
       let s := s.setReg .rsp (rsp + 8)
       set_reg_or_mem s dst val ret)
 
-  | .ret =>
-      -- Pop return address from stack and jump to it
-      let rsp := s.getReg .rsp
-      s.readMem rsp (fun retAddr =>
-      let s := s.setReg .rsp (rsp + 8)
-      ret { s with rip := retAddr })
+  | .endbr64 => ret s  -- no-op: CET instruction ignored by Kraken
 
   | _ => throw s!"unsupported non-control instruction {repr i}"
 
@@ -1124,6 +1144,19 @@ def ctrl [Throw α] (s: MachineState) (lookup: Label → (UInt64 → α) → α)
   | .jmp l =>
       lookup l (fun rip =>
       jump_if s True rip ret)
+  | .call l =>
+      -- Push return address (next instruction) onto stack, then jump to l.
+      lookup l (fun targetRip =>
+      let newRsp := s.getReg .rsp - 8
+      let s := s.setReg .rsp newRsp
+      s.writeMem newRsp (s.rip + 1) (fun s =>
+      ret { s with rip := targetRip }))
+  | .ret =>
+      -- Pop return address from stack and jump to it.
+      let rsp := s.getReg .rsp
+      s.readMem rsp (fun retAddr =>
+      let s := s.setReg .rsp (rsp + 8)
+      ret { s with rip := retAddr })
   | .jcc cc l =>
       lookup l (fun rip =>
       let cond := match cc with
@@ -1133,6 +1166,10 @@ def ctrl [Throw α] (s: MachineState) (lookup: Label → (UInt64 → α) → α)
         | .ae => !s.flags.cf          -- Above/Equal: CF=0
         | .a  => !s.flags.cf && !s.flags.zf  -- Above: CF=0 ∧ ZF=0
         | .be => s.flags.cf || s.flags.zf    -- Below/Equal: CF=1 ∨ ZF=1
+        | .l  => s.flags.sf != s.flags.of    -- Less: SF≠OF
+        | .ge => s.flags.sf == s.flags.of    -- Greater/Equal: SF=OF
+        | .le => s.flags.zf || (s.flags.sf != s.flags.of)   -- LE: ZF=1 ∨ SF≠OF
+        | .g  => !s.flags.zf && (s.flags.sf == s.flags.of)  -- Greater: ZF=0 ∧ SF=OF
       jump_if s cond rip ret)
   | _ => throw s!"unsupported control instruction {repr i}"
 
