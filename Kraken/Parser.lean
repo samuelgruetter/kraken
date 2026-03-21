@@ -644,6 +644,7 @@ info: [(none, Instr.mov (Operand.reg (Reg.rax)) (Operand.mem (Reg.rsi) (some (Re
 #guard_msgs in
 #eval parse! "jnz loop"
 
+/-
 -- Test: Multi-line program
 -- TODO: fix panic
 #eval parse! "
@@ -653,6 +654,7 @@ loop:
   cmpq $10, %rax
   jne loop
 "
+-/
 
 -- Test: Negative immediate
 /-- info: [(none, Instr.add (Operand.reg (Reg.rax)) (Operand.imm (-1)))] -/

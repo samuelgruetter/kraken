@@ -119,10 +119,8 @@ def calcOutputSize (regions : List MemRegion) : Nat :=
 
 /-- Generate assembly to write output to stdout and exit. -/
 def genWriteAndExit (regions : List MemRegion) : String :=
-  let regBytes := 136
   let memHeaderSize := if regions.isEmpty then 0 else 8 -- _kraken_mem_region_count
   let memDataSize := regions.foldl (fun acc r => acc + 16 + r.size * 8) 0 -- base + size + data per region
-  let totalBytes := regBytes + memHeaderSize + memDataSize
 
   -- Write registers first
   "    # Write register state to stdout (136 bytes)\n" ++
