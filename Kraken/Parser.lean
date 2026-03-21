@@ -585,19 +585,132 @@ partial def parseProgramAux (acc : Program) : Parser Program := do
 def parseProgram : Parser Program := parseProgramAux []
 
 -- ============================================================================
+-- Full Assembly File Parsing
+-- ============================================================================
+
+/-- A parsed assembly file with separate program and data sections. -/
+structure ProgramWithDataSection where
+  prog       : Program
+  dataLabels : List (String × UInt64)
+  deriving Repr
+
+instance : Inhabited ProgramWithDataSection where
+  default := { prog := [], dataLabels := [] }
+
+private inductive FileLine
+  | sectionData
+  | sectionText
+  | dataEntry (label : String) (value : UInt64)
+  | labelOnly  (name  : String)
+  | instr      (lbl   : Option Label) (i : Instr)
+  | skip
+
+/-- Parse one line of a full assembly file (without consuming the trailing newline). -/
+private def parseFileLine : Parser FileLine := do
+  skipHWs
+  let c ← peek!
+  if c == '\n' || c == '#' then
+    if c == '#' then skipLineComment
+    pure .skip
+  else if c == '.' then
+    -- Directive line: .data, .text, .align, .globl, .quad, etc.
+    let name ← parseName
+    match name with
+    | ".data" => pure .sectionData
+    | ".text" => pure .sectionText
+    | _ => pure .skip
+  else
+    -- Starts with an identifier: either "label:" or a bare instruction mnemonic.
+    attempt (do
+      let name ← parseName
+      skipHWs
+      let _ ← pchar ':'
+      skipHWs
+      let c2 ← peek!
+      if c2 == '\n' || c2 == '#' then
+        pure (.labelOnly name)
+      else if c2 == '.' then
+        -- Could be ".quad N" (data entry) or another directive.
+        let directive ← parseName
+        skipHWs
+        if directive == ".quad" then
+          let v ← parseInt
+          pure (.dataEntry name v.toNat.toUInt64)
+        else
+          pure (.labelOnly name)
+      else
+        let i ← parseInstr
+        pure (.instr (some name) i)
+    ) <|> (do
+      let i ← parseInstr
+      pure (.instr none i)
+    )
+
+private structure FileParseState where
+  inData     : Bool := false
+  inText     : Bool := false
+  collecting : Bool := false
+  dataAcc    : List (String × UInt64) := []
+  instrAcc   : Program := []
+
+private partial def parseProgramWithDataAux (st : FileParseState) : Parser ProgramWithDataSection := do
+  let done ← (eof *> pure true) <|> pure false
+  if done then
+    pure { prog := st.instrAcc, dataLabels := st.dataAcc }
+  else
+    let line ← parseFileLine
+    skipToEndOfLine
+    let st' :=
+      match line with
+      | .sectionData => { st with inData := true, inText := false }
+      | .sectionText => { st with inData := false, inText := true }
+      | .dataEntry lbl val =>
+          if st.inData then { st with dataAcc := st.dataAcc ++ [(lbl, val)] }
+          else st
+      | .labelOnly "_start" =>
+          if st.inText then { st with collecting := true } else st
+      | .labelOnly _ => st
+      | .instr _ (.jmp "_kraken_capture") =>
+          { st with collecting := false, inText := false }
+      | .instr lbl i =>
+          if st.collecting then { st with instrAcc := st.instrAcc ++ [(lbl, i)] }
+          else st
+      | .skip => st
+    parseProgramWithDataAux st'
+
+/-- Parse a complete assembly file into a ProgramWithDataSection,
+    collecting data labels from the .data section and instructions
+    from between _start: and jmp _kraken_capture. -/
+def parseProgramWithData : Parser ProgramWithDataSection :=
+  parseProgramWithDataAux {}
+
+-- ============================================================================
 -- Public API
 -- ============================================================================
 
-/-- Parse an assembly string into a Program.
+/-- Parse a complete assembly file (with .data/.text sections and _start:)
+    into a ProgramWithDataSection. Returns an error message on failure. -/
+def parse (input : String) : Except String ProgramWithDataSection :=
+  match parseProgramWithData input.mkIterator with
+  | .success _ pwds => .ok pwds
+  | .error _ msg => .error msg
+
+/-- Parse a complete assembly file, panicking on failure (for use in #eval). -/
+def parse! (input : String) : ProgramWithDataSection :=
+  match parse input with
+  | .ok pwds => pwds
+  | .error msg => panic! s!"parse error: {msg}"
+
+/-- Parse a bare assembly snippet (no section directives) into a Program.
     Returns an error message on failure. -/
-def parse (input : String) : Except String Program :=
+def parseSnippet (input : String) : Except String Program :=
   match parseProgram input.mkIterator with
   | .success _ prog => .ok prog
   | .error _ msg => .error msg
 
-/-- Parse an assembly string, panicking on failure (for use in #eval). -/
-def parse! (input : String) : Program :=
-  match parse input with
+/-- Parse a bare assembly snippet, panicking on failure (for use in #eval). -/
+def parseSnippet! (input : String) : Program :=
+  match parseSnippet input with
   | .ok prog => prog
   | .error msg => panic! s!"parse error: {msg}"
 
@@ -615,39 +728,39 @@ open Instr Operand Reg
 -- Test: Simple instruction
 /-- info: [(none, Instr.add (Operand.reg (Reg.rbx)) (Operand.reg (Reg.rax)))] -/
 #guard_msgs in
-#eval parse! "addq %rax, %rbx"
+#eval parseSnippet! "addq %rax, %rbx"
 
 -- Test: Immediate operand
 /-- info: [(none, Instr.mov (Operand.reg (Reg.rax)) (Operand.imm 42))] -/
 #guard_msgs in
-#eval parse! "movq $42, %rax"
+#eval parseSnippet! "movq $42, %rax"
 
 -- Test: Memory operand with displacement
 /-- info: [(none, Instr.mov (Operand.reg (Reg.rax)) (Operand.mem (Reg.rsp) none 1 8))] -/
 #guard_msgs in
-#eval parse! "movq 8(%rsp), %rax"
+#eval parseSnippet! "movq 8(%rsp), %rax"
 
 -- Test: Memory operand with index and scale
 /--
 info: [(none, Instr.mov (Operand.reg (Reg.rax)) (Operand.mem (Reg.rsi) (some (Reg.r15)) 8 0))]
 -/
 #guard_msgs in
-#eval parse! "movq (%rsi, %r15, 8), %rax"
+#eval parseSnippet! "movq (%rsi, %r15, 8), %rax"
 
 -- Test: Labeled instruction
 /-- info: [(some "loop", Instr.add (Operand.reg (Reg.rcx)) (Operand.imm 1))] -/
 #guard_msgs in
-#eval parse! "loop: addq $1, %rcx"
+#eval parseSnippet! "loop: addq $1, %rcx"
 
 -- Test: Conditional jump
 /-- info: [(none, Instr.jcc (CondCode.nz) "loop")] -/
 #guard_msgs in
-#eval parse! "jnz loop"
+#eval parseSnippet! "jnz loop"
 
 /-
 -- Test: Multi-line program
 -- TODO: fix panic
-#eval parse! "
+#eval parseSnippet! "
   movq $0, %rax
 loop:
   addq $1, %rax
@@ -659,28 +772,28 @@ loop:
 -- Test: Negative immediate
 /-- info: [(none, Instr.add (Operand.reg (Reg.rax)) (Operand.imm (-1)))] -/
 #guard_msgs in
-#eval parse! "addq $-1, %rax"
+#eval parseSnippet! "addq $-1, %rax"
 
 -- Test: Hex immediate
 /-- info: [(none, Instr.mov (Operand.reg (Reg.rax)) (Operand.imm 255))] -/
 #guard_msgs in
-#eval parse! "movq $0xff, %rax"
+#eval parseSnippet! "movq $0xff, %rax"
 
 -- Test: mulx instruction
 /--
 info: [(none, Instr.mulx (Operand.reg (Reg.r10)) (Operand.reg (Reg.r9)) (Operand.reg (Reg.r8)))]
 -/
 #guard_msgs in
-#eval parse! "mulxq %r8, %r9, %r10"
+#eval parseSnippet! "mulxq %r8, %r9, %r10"
 
 -- Test: xor for zeroing
 /-- info: [(none, Instr.xor (Operand.reg (Reg.rax)) (Operand.reg (Reg.rax)))] -/
 #guard_msgs in
-#eval parse! "xorq %rax, %rax"
+#eval parseSnippet! "xorq %rax, %rax"
 
 -- Test: lea with complex addressing
 /-- info: [(none, Instr.lea (Reg.rax) (Operand.mem (Reg.rbp) (some (Reg.rcx)) 4 16))] -/
 #guard_msgs in
-#eval parse! "leaq 16(%rbp, %rcx, 4), %rax"
+#eval parseSnippet! "leaq 16(%rbp, %rcx, 4), %rax"
 
 end Tests
