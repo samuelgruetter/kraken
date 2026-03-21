@@ -641,10 +641,12 @@ private def parseFileLine : Parser FileLine := do
       else
         let i ← parseInstr
         pure (.instr (some name) i)
-    ) <|> (do
+    ) <|>
+    attempt (do
       let i ← parseInstr
       pure (.instr none i)
-    )
+    ) <|>
+    pure .skip  -- unrecognised token: skip this line
 
 private structure FileParseState where
   inData     : Bool := false
