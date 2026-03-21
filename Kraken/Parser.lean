@@ -641,23 +641,22 @@ private def parseFileLine : Parser FileLine := do
       else
         let i ← parseInstr
         pure (.instr (some name) i)
-    ) <|>
-    attempt (do
+    ) <|> (do
       let i ← parseInstr
       pure (.instr none i)
-    ) <|>
-    pure .skip  -- unrecognised token: skip this line
+    )
 
 private structure FileParseState where
-  inData     : Bool := false
-  inText     : Bool := false
-  collecting : Bool := false
-  dataAcc    : List (String × UInt64) := []
-  instrAcc   : Program := []
+  inData               : Bool := false
+  inText               : Bool := false
+  collecting           : Bool := false
+  sawKrakenCaptureJmp  : Bool := false
+  dataAcc              : List (String × UInt64) := []
+  instrAcc             : Program := []
 
 private partial def parseProgramWithDataAux (st : FileParseState) : Parser ProgramWithDataSection := do
   let done ← (eof *> pure true) <|> pure false
-  if done then
+  if done || st.sawKrakenCaptureJmp then
     pure { prog := st.instrAcc, dataLabels := st.dataAcc }
   else
     let line ← parseFileLine
@@ -673,7 +672,7 @@ private partial def parseProgramWithDataAux (st : FileParseState) : Parser Progr
           if st.inText then { st with collecting := true } else st
       | .labelOnly _ => st
       | .instr _ (.jmp "_kraken_capture") =>
-          { st with collecting := false, inText := false }
+          { st with sawKrakenCaptureJmp := true }
       | .instr lbl i =>
           if st.collecting then { st with instrAcc := st.instrAcc ++ [(lbl, i)] }
           else st
