@@ -113,24 +113,12 @@ structure Flags where
   cf : Bool := false -- Carry Flag
 deriving Repr, BEq
 
--- Heap
--- We only reason about aligned accesses, so our map only has keys that are = 0
--- % 8. We do not make any assumptions about the memory -- reading an
--- uninitialized value results in an error.
+-- Address and word types used throughout the semantics.
 abbrev Address := UInt64
 abbrev Word := UInt64
-abbrev Heap := Std.ExtHashMap Address Word
 
-instance : Repr Heap where
-  reprPrec _ _ := "<opaque memory>"
-
--- Machine State
-structure MachineState where
-  regs : Registers := {}
-  flags : Flags := {}
-  rip : Nat := 0
-  heap : Heap := ∅
-deriving Repr
+-- Note: Memory and MachineState are defined after inductive Instr (below),
+-- because Memory contains MemCell which contains Instr.
 
 -- Operands (extended with indexed memory modes for MontMul)
 -- Memory operands use WORD offsets (multiplied by 8 in code gen) for alignment
@@ -144,6 +132,10 @@ inductive Operand
   -- Standard x86: base + idx*scale + disp. E.g. 8(%rsp) = disp 8, (%rsi,%r15,8) = idx .r15
   -- Per Intel SDM Vol. 2A Section 2.1.5 (SIB byte), valid scale values are 1, 2, 4, 8.
   -- The default scale is 1 (SIB SS bits = 00). Scale must be explicit in AT&T syntax when != 1.
+| ripRel (label : Option String) (disp : Int := 0)
+  -- RIP-relative: label(%rip) or disp(%rip).
+  -- If label is given, effective address = address_of_label + disp (resolved via labelAddrs).
+  -- If label is none, effective address = rip + disp (numeric RIP-relative displacement).
 deriving Repr, BEq
 
 instance : Coe Reg Operand where coe := Operand.reg
@@ -271,6 +263,58 @@ inductive Instr
 def Instr.is_ctrl
   | Instr.jmp _ | Instr.jcc _ _ | Instr.ret => true
   | _ => false
+
+-- ============================================================================
+-- Memory Cell Type
+-- ============================================================================
+
+/-- A cell in unified memory: either a 64-bit data word or an instruction with optional label.
+    Data cells live at 8-byte-aligned addresses; instruction cells at sequential byte addresses.
+    TODO: We assume each instruction occupies 1 byte. Real x86 instructions are 1–15 bytes. -/
+inductive MemCell
+  | data  (v : Word)                        -- 64-bit data word in the data region
+  | instr (label : Option Label) (i : Instr) -- instruction (with optional label) in code region
+  deriving Repr
+
+-- ============================================================================
+-- Memory
+-- ============================================================================
+
+/-- Unified memory: maps byte addresses to either data words or instructions.
+    - Data region: addresses that are 0 mod 8, containing Word values.
+    - Code region: sequential byte addresses (one per instruction).
+    TODO: Real x86 instructions are variable-size (1–15 bytes); the 1-byte-per-instruction
+    assumption here is a simplification that affects RIP computation and instruction boundaries. -/
+abbrev Memory := Std.ExtHashMap Address MemCell
+
+instance : Repr Memory where
+  reprPrec _ _ := "<opaque memory>"
+
+instance : Repr (Std.HashMap String UInt64) where
+  reprPrec _ _ := "<labels>"
+
+-- ============================================================================
+-- Machine State
+-- ============================================================================
+
+/-- Machine state: registers, flags, instruction pointer, and unified memory.
+    The program (instructions) is stored in memory at sequential byte addresses
+    starting from 0, alongside data at 8-byte-aligned addresses.
+    All functions that previously took a separate (p : Program) parameter now
+    take (s : MachineState) instead, since the program lives in s.memory. -/
+structure MachineState where
+  regs      : Registers := {}
+  flags     : Flags := {}
+  /-- Instruction pointer: byte address of the current instruction in memory.
+      TODO: With the 1-byte-per-instruction assumption this is just an index.
+      Real x86 uses actual byte offsets into the encoded binary. -/
+  rip       : UInt64 := 0
+  /-- Unified memory containing both code (MemCell.instr) and data (MemCell.data) cells. -/
+  memory    : Memory := ∅
+  /-- Label-to-address table populated when loading a program.
+      Maps both code labels (jump targets) and data labels (for RIP-relative) to addresses. -/
+  labelAddrs : Std.HashMap String UInt64 := ∅
+  deriving Repr
 
 -- ============================================================================
 -- Register Access
@@ -412,15 +456,16 @@ def MachineState.readMem [Throw α] (s : MachineState) (addr : Address) (ret: Wo
   if addr % 8 != 0 then
     throw (s!"Out-of-bounds access (rip={repr s.rip})")
   else
-    match s.heap[addr]? with
-    | .some v => ret v
+    match s.memory[addr]? with
+    | .some (.data v) => ret v
+    | .some (.instr _ _) => throw (s!"Data read from code region (rip={repr s.rip}, addr={repr addr})")
     | .none => throw (s!"Memory read but not written to (rip={repr s.rip}, addr={repr addr})")
 
 def MachineState.writeMem [Throw α] (s : MachineState) (addr : Address) (val : Word) (ret: MachineState → α) : α :=
   if addr % 8 != 0 then
     throw s!"Out-of-bounds access (rip={repr s.rip})"
   else
-    ret { s with heap := s.heap.insert addr val }
+    ret { s with memory := s.memory.insert addr (.data val) }
 
 -- Sign-extension helpers: use standard integer type conversions
 -- Strategy: truncate to input size → signed Int conversion → convert to UInt64
@@ -463,12 +508,22 @@ def MachineState.writeMem [Throw α] (s : MachineState) (addr : Address) (val : 
 
 
 
--- Compute effective address: base + idx*scale + disp
+-- Compute effective address: base + idx*scale + disp, or RIP-relative label/displacement
 def effective_addr [Throw α] (s : MachineState) (o : Operand) (ret: UInt64 → α): α :=
   match o with
   | .mem base idx scale disp =>
     let idxVal := match idx with | .some r => s.getReg r | .none => 0
     ret ((s.getReg base) + idxVal * scale.toUInt64 + UInt64.ofInt disp)
+  | .ripRel (some label) disp =>
+    -- Label-based RIP-relative: resolve label to its address via the label table.
+    match s.labelAddrs[label]? with
+    | some addr => ret (addr + UInt64.ofInt disp)
+    | none => throw s!"Unknown label '{label}' in RIP-relative operand (rip={repr s.rip})"
+  | .ripRel none disp =>
+    -- Numeric RIP-relative displacement only.
+    -- TODO: In real x86, RIP points to the next instruction during execution.
+    -- With the 1-byte-per-instruction assumption, we use s.rip directly.
+    ret (s.rip + UInt64.ofInt disp)
   | _ => throw "effective_addr called on non-memory operand"
 
 def eval_operand [Throw α] (s : MachineState) (o : Operand) (ret: UInt64 → α): α :=
@@ -476,11 +531,13 @@ def eval_operand [Throw α] (s : MachineState) (o : Operand) (ret: UInt64 → α
   | .reg r => ret (s.getReg r)
   | .imm v => ret (eval_imm v)
   | .mem _ _ _ _ => effective_addr s o (fun addr => s.readMem addr ret)
+  | .ripRel _ _ => effective_addr s o (fun addr => s.readMem addr ret)
 
 def eval_reg_or_mem [Throw α] (s : MachineState) (o : Operand) (ret: UInt64 → α): α :=
   match o with
   | .reg r => ret (s.getReg r)
   | .mem _ _ _ _ => effective_addr s o (fun addr => s.readMem addr ret)
+  | .ripRel _ _ => effective_addr s o (fun addr => s.readMem addr ret)
   | .imm _ => throw "Ill-formed instruction (rip={repr s.rip})"
 
 def set_reg_or_mem [Throw α] (s: MachineState) (o: Operand) (v: Word) (ret: MachineState → α): α :=
@@ -488,6 +545,8 @@ def set_reg_or_mem [Throw α] (s: MachineState) (o: Operand) (v: Word) (ret: Mac
   | .reg r =>
       ret (s.setReg r v)
   | .mem _ _ _ _ =>
+      effective_addr s o (fun addr => s.writeMem addr v ret)
+  | .ripRel _ _ =>
       effective_addr s o (fun addr => s.writeMem addr v ret)
   | .imm _ =>
       throw "Ill-formed instruction (rip={repr s.rip})"
@@ -497,6 +556,7 @@ def set_reg [Throw α] (s: MachineState) (o: Operand) (v: Word) (ret: MachineSta
   | .reg r =>
       ret (s.setReg r v)
   | .mem _ _ _ _
+  | .ripRel _ _
   | .imm _ =>
       throw "Ill-formed instruction (rip={repr s.rip})"
 
@@ -1045,18 +1105,17 @@ def strt1 [Throw α] (s : MachineState) (i : Instr) (ret: MachineState → α): 
       let rsp := s.getReg .rsp
       s.readMem rsp (fun retAddr =>
       let s := s.setReg .rsp (rsp + 8)
-      ret { s with rip := retAddr.toNat })
+      ret { s with rip := retAddr })
 
   | _ => throw s!"unsupported non-control instruction {repr i}"
 
-def jump_if [Throw α] (s: MachineState) (b: Bool) (rip: Nat) (ret: MachineState → α): α :=
+def jump_if [Throw α] (s: MachineState) (b: Bool) (rip: UInt64) (ret: MachineState → α): α :=
   if b then
     ret { s with rip }
   else
     ret (next s)
 
-
-def ctrl [Throw α] (s: MachineState) (lookup: Label → (Nat → α) → α) (i: Instr) (ret: MachineState → α): α :=
+def ctrl [Throw α] (s: MachineState) (lookup: Label → (UInt64 → α) → α) (i: Instr) (ret: MachineState → α): α :=
   match i with
   | .jmp l =>
       lookup l (fun rip =>
@@ -1073,27 +1132,61 @@ def ctrl [Throw α] (s: MachineState) (lookup: Label → (Nat → α) → α) (i
       jump_if s cond rip ret)
   | _ => throw s!"unsupported control instruction {repr i}"
 
+/-- Program: a list of (optional label, instruction) pairs.
+    Programs are loaded into MachineState.memory by the test harness;
+    instructions live at sequential byte addresses starting from 0.
+    TODO: Each instruction is assumed to be 1 byte. Real x86 instructions are variable-size. -/
 abbrev Program := List (Option Label × Instr)
 
-def lookup [Throw α] (p: Program) (l: Label) (ret: Nat → α): α :=
-  match p.findIdx? (fun (l', _) => l' = .some l) with
-  | .some rip => ret rip
+/-- Look up a label's address in the machine state's label table.
+    Previously took a (p: Program) parameter; now uses (s: MachineState) since
+    the program and its labels are stored in s.memory / s.labelAddrs. -/
+def lookup [Throw α] (s: MachineState) (l: Label) (ret: UInt64 → α): α :=
+  match s.labelAddrs[l]? with
+  | .some addr => ret addr
   | .none => throw s!"Invalid label: {repr l}"
 
-def fetch [Throw α] (p: Program) (s: MachineState) (ret: (Option Label × Instr) → α): α :=
-  match p[s.rip]? with
-  | .some ins => ret ins
-  | .none => throw "Impossible: PC outside of program bounds"
+/-- Fetch the instruction at the current RIP from memory.
+    Previously took a (p: Program) parameter; now uses (s: MachineState) since
+    instructions are stored in s.memory. -/
+def fetch [Throw α] (s: MachineState) (ret: (Option Label × Instr) → α): α :=
+  match s.memory[s.rip]? with
+  | .some (.instr lbl i) => ret (lbl, i)
+  | .some (.data _) => throw s!"PC points to data region (rip={repr s.rip})"
+  | .none => throw s!"PC outside program bounds (rip={repr s.rip})"
 
-def eval1 [m: Throw α] (p: Program) (s: MachineState) (ret: MachineState → α): α :=
-  fetch p s (fun (_, i) =>
+/-- Evaluate one instruction step.
+    Previously took a (p: Program) parameter; now takes only (s: MachineState)
+    since the program lives in s.memory and labels in s.labelAddrs. -/
+def eval1 [m: Throw α] (s: MachineState) (ret: MachineState → α): α :=
+  fetch s (fun (_, i) =>
     if i.is_ctrl then
-      ctrl s (lookup p) i ret
+      ctrl s (lookup s) i ret
     else
       strt1 s i (fun s =>
       ret (next s)))
 
-def eval (p: Program) (s: MachineState): Option MachineState := do
-  let s ← (eval1 (m:={ throw _ := Option.none }) p s) (fun s => .some s)
-  eval p s
+/-- Evaluate until termination (no fuel limit — use runBounded in TestHarness).
+    Previously took a (p: Program) parameter; now takes only (s: MachineState). -/
+def eval (s: MachineState): Option MachineState := do
+  let s ← (eval1 (m:={ throw _ := Option.none }) s) (fun s => .some s)
+  eval s
 partial_fixpoint
+
+/-- Read a data word from unified memory at the given address, returning none if absent or code. -/
+def readDataCell (mem : Memory) (addr : Address) : Option Word :=
+  match mem[addr]? with
+  | some (.data v) => some v
+  | _ => none
+
+/-- Build a MachineState from a Program by placing instructions in memory at sequential
+    byte addresses (0, 1, 2, …) and recording their labels in labelAddrs.
+    TODO: Each instruction occupies 1 byte in this model; real x86 instructions are variable-size. -/
+def programToMachineState (p : Program) : MachineState :=
+  let (mem, lbls) := p.zipIdx.foldl (fun (m, a) ((lbl, instr), i) =>
+    let m' := m.insert i.toUInt64 (.instr lbl instr)
+    let a' := match lbl with
+      | some l => a.insert l i.toUInt64
+      | none   => a
+    (m', a')) (∅, ∅)
+  { memory := mem, labelAddrs := lbls, rip := 0 }

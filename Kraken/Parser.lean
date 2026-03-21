@@ -147,6 +147,26 @@ def parseImm : Parser Operand := do
     Int64.ofInt v
   pure (.imm i64)
 
+/-- Parse a RIP-relative memory operand: label(%rip) or disp(%rip). -/
+def parseRIPRel : Parser Operand := do
+  skipHWs
+  -- Either a label name or a numeric displacement precedes (%rip)
+  let labelOrDisp : Sum String Int ←
+    (do let n ← parseName; pure (.inl n)) <|>
+    (do let d ← parseInt;  pure (.inr d)) <|>
+    pure (.inr 0)
+  skipHWs
+  let _ ← pchar '('
+  skipHWs
+  let _ ← pchar '%'
+  let regName ← parseName
+  if regName.toLower != "rip" then fail s!"expected %rip, got %{regName}"
+  skipHWs
+  let _ ← pchar ')'
+  match labelOrDisp with
+  | .inl lbl => pure (.ripRel (some lbl) 0)
+  | .inr d   => pure (.ripRel none d)
+
 /-- Parse a memory operand: disp(%base), (%base,%idx,scale), etc. -/
 def parseMemory : Parser Operand := do
   skipHWs
@@ -178,7 +198,7 @@ def parseMemory : Parser Operand := do
   let _ ← pchar ')'
   pure (.mem base idx scale disp)
 
-/-- Parse any operand: register, immediate, or memory. -/
+/-- Parse any operand: register, immediate, memory, or RIP-relative. -/
 def parseOperand : Parser Operand := do
   skipHWs
   let c ← peek!
@@ -187,8 +207,12 @@ def parseOperand : Parser Operand := do
     pure (.reg r)
   else if c == '$' then
     parseImm
+  else if c.isAlpha || c == '_' then
+    -- Must be label(%rip) — labels as operands are only valid in RIP-relative form
+    parseRIPRel
   else if c == '(' || c == '-' || c.isDigit then
-    parseMemory
+    -- Could be disp(%rip) or a normal memory operand; try RIP-relative first
+    attempt parseRIPRel <|> parseMemory
   else
     fail s!"expected operand, got '{c}'"
 
@@ -199,8 +223,10 @@ def parseRegOrMem : Parser Operand := do
   if c == '%' then
     let r ← parseReg
     pure (.reg r)
+  else if c.isAlpha || c == '_' then
+    parseRIPRel
   else if c == '(' || c == '-' || c.isDigit then
-    parseMemory
+    attempt parseRIPRel <|> parseMemory
   else
     fail "expected register or memory operand"
 

@@ -14,33 +14,35 @@ import Kraken.Theorems
 
 def Post := MachineState → Prop
 
-def step1 (p: Program) (s: MachineState) (post: Post) :=
-  eval1 (m:={ throw _ := False }) p s post
+-- step1: evaluate one step from state s, yielding post-condition.
+-- The program is now contained in s.memory, so no separate Program parameter is needed.
+def step1 (s: MachineState) (post: Post) :=
+  eval1 (m:={ throw _ := False }) s post
 
-inductive eventually (prog: Program) (p: MachineState → Prop): MachineState -> Prop
+inductive eventually (p: MachineState → Prop): MachineState -> Prop
   | done (initial: MachineState):
       p initial →
-      eventually _ p initial
+      eventually p initial
   | step (initial: MachineState):
       (mid_p: Post) ->
-      step1 prog initial mid_p →
-      (forall (mid: MachineState), mid_p mid → eventually _ p mid) →
-      eventually _ p initial
+      step1 initial mid_p →
+      (forall (mid: MachineState), mid_p mid → eventually p mid) →
+      eventually p initial
 
 -- THEOREMS
 
-theorem step_cps {p : Program} (post: Post) (initial: MachineState):
-  step1 p initial (fun mid => eventually p post mid) → eventually p post initial :=
+theorem step_cps (post: Post) (initial: MachineState):
+  step1 initial (fun mid => eventually post mid) → eventually post initial :=
   by
     intro
     apply eventually.step
     <;> try assumption
     grind
 
-theorem eventually_trans (program: Program) (p q: Post) (initial: MachineState)
-  (e: eventually program p initial)
-  (h: forall s, p s → eventually program q s):
-    eventually program q initial
+theorem eventually_trans (p q: Post) (initial: MachineState)
+  (e: eventually p initial)
+  (h: forall s, p s → eventually q s):
+    eventually q initial
   := by
     induction e with
     | done =>
@@ -49,9 +51,9 @@ theorem eventually_trans (program: Program) (p q: Post) (initial: MachineState)
         apply eventually.step
         <;> assumption -- Q: why does `grind` not work here?
 
-theorem eventually_weaken (program: Program) (p q: Post)
+theorem eventually_weaken (p q: Post)
   (h: forall s, p s → q s):
-    eventually program p initial → eventually program q initial
+    eventually p initial → eventually q initial
   := by
     intro hp
     induction ih: hp -- Q: why does this not work with `induction ... with`?
@@ -62,16 +64,16 @@ theorem eventually_weaken (program: Program) (p q: Post)
       grind
 
 -- A loop down to 0
-theorem reg_dec_loop (prog: Program) (post: Post) (initial: MachineState) (invariant: Nat → Post) (n: Nat):
+theorem reg_dec_loop (post: Post) (initial: MachineState) (invariant: Nat → Post) (n: Nat):
   -- if:
   -- invariant holds before entering the loop
   invariant n initial ∧
   -- final iteration allows proving `post`
-  (forall state, invariant 0 state → eventually prog post state) ∧
+  (forall state, invariant 0 state → eventually post state) ∧
   -- while iterating, we eventually re-establish the invariant
-  (forall state k, k ≠ 0 → invariant k state → eventually prog (invariant (k - 1)) state) →
+  (forall state k, k ≠ 0 → invariant k state → eventually (invariant (k - 1)) state) →
   -- then: we can prove the post
-  eventually prog post initial
+  eventually post initial
   := by
     intro misc
     rcases misc with ⟨ initial_invariant, case_zero, case_nonzero ⟩
@@ -79,10 +81,10 @@ theorem reg_dec_loop (prog: Program) (post: Post) (initial: MachineState) (invar
       apply case_zero
       grind
     else
-      apply eventually_trans prog (invariant (n - 1)) post
+      apply eventually_trans (invariant (n - 1)) post
       grind
       intros srec _
-      apply reg_dec_loop prog post srec invariant (n - 1)
+      apply reg_dec_loop post srec invariant (n - 1)
       grind
 
 -- TACTIC MACROS
@@ -107,7 +109,6 @@ macro_rules
   | `(tactic|step_instr) =>
   `(tactic|
     delta step1 eval1 fetch;
-    dsimp only [List.findIdx?,List.findIdx,getElem?,List.get?Internal];
     dsimp only [Instr.is_ctrl];
     dsimp only [Bool.false_eq_true, ↓dreduceIte]; -- special simproc for if https://github.com/leanprover/lean4/blob/master/src/Lean/Meta/Tactic/Simp/BuiltinSimprocs/Core.lean#L25-L40
     delta next
@@ -133,4 +134,4 @@ macro_rules
       -- works for calls to strt1
       strt1,eval_operand,eval_reg_or_mem,set_reg,set_reg_or_mem,effective_addr,eval_imm,sub_with_borrow,add_with_carry,sub_overflow,add_overflow,MachineState.setReg,next,Registers.set,pure,bind,next,MachineState.getReg,Registers.get,
       -- or calls to ctrl
-      ctrl,lookup,List.findIdx?,List.findIdx?.go,pure,bind,jump_if,next] <;> try native_decide)
+      ctrl,lookup,jump_if,next] <;> try native_decide)

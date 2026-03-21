@@ -60,7 +60,7 @@ def genCaptureDataRegs : String :=
 def genCaptureDataMem (regions : List MemRegion) : String :=
   if regions.isEmpty then ""
   else
-    let regionData := regions.enum.map fun (i, r) =>
+    let regionData := regions.zipIdx.map fun (r, i) =>
       s!"# Memory region {i}: base={r.base}, size={r.size} words\n" ++
       s!"_kraken_mem_region_{i}_base: .quad {r.base.toNat}\n" ++
       s!"_kraken_mem_region_{i}_size: .quad {r.size}\n" ++
@@ -101,7 +101,7 @@ def genSaveRegisters : String :=
 def genCopyMemoryRegions (regions : List MemRegion) : String :=
   if regions.isEmpty then ""
   else
-    let copies := regions.enum.map fun (i, r) =>
+    let copies := regions.zipIdx.map fun (r, i) =>
       s!"    # Copy memory region {i}\n" ++
       s!"    movq _kraken_mem_region_{i}_base(%rip), %rsi  # source = base\n" ++
       s!"    leaq _kraken_mem_region_{i}_data(%rip), %rdi  # dest = buffer\n" ++
@@ -287,14 +287,13 @@ def compareFlags (expected actual : Flags) : List String :=
     if exp != act then some s!"{name}: expected {exp}, got {act}"
     else none
 
-/-- Extract memory values from Kraken's sparse heap for comparison. -/
-def extractKrakenMemory (heap : Heap) (regions : List MemRegion)
+/-- Extract memory values from Kraken's unified memory for comparison.
+    Only reads MemCell.data entries; uninitialized or code cells yield 0. -/
+def extractKrakenMemory (mem : Memory) (regions : List MemRegion)
     : List (UInt64 × Array UInt64) :=
   regions.map fun r =>
     let values := Array.range r.size |>.map fun i =>
-      match heap[(r.base + i.toUInt64 * 8)]? with
-      | some v => v
-      | none => 0  -- Uninitialized = 0
+      (readDataCell mem (r.base + i.toUInt64 * 8)).getD 0
     (r.base, values)
 
 /-- Compare memory regions, returning list of differences. -/
@@ -304,7 +303,7 @@ def compareMemory (expected actual : List (UInt64 × Array UInt64)) : List Strin
     if expBase != actBase then
       acc ++ [s!"memory base mismatch: expected {expBase}, got {actBase}"]
     else
-      let valDiffs := expVals.toList.zip actVals.toList |>.enum.filterMap fun (i, (e, a)) =>
+      let valDiffs := expVals.toList.zip actVals.toList |>.zipIdx.filterMap fun ((e, a), i) =>
         if e != a then some s!"mem[{expBase}+{i*8}]: expected {e}, got {a}"
         else none
       acc ++ valDiffs
@@ -314,22 +313,105 @@ def compareMemory (expected actual : List (UInt64 × Array UInt64)) : List Strin
 -- Kraken Execution
 -- ============================================================================
 
+/-- Extract testable instructions from assembly code.
+    Looks for code between _start: and jmp _kraken_capture,
+    filtering out directives and comments. -/
+def extractTestableCode (asmCode : String) : String :=
+  let lines := asmCode.splitOn "\n"
+  let inTest := lines.foldl (fun (acc, inBlock) line =>
+    let trimmed := line.trim
+    if trimmed.startsWith "_start:" then (acc, true)
+    else if inBlock && trimmed.startsWith "jmp" && trimmed.endsWith "_kraken_capture" then
+      (acc, false)
+    else if inBlock then
+      -- Skip directives, empty lines, and comment-only lines
+      let isDirective := trimmed.startsWith "." || trimmed.isEmpty || trimmed.startsWith "#"
+      if isDirective then (acc, inBlock)
+      else (acc ++ [line], inBlock)
+    else (acc, inBlock)
+  ) ([], false)
+  String.intercalate "\n" inTest.1
+
+/-- Extract (label, value) pairs from .data sections of assembly code.
+    Handles the common patterns used in Kraken test files:
+      label: .quad N     (label and value on same line)
+      label:             (label-only line, followed by .quad N) -/
+def extractDataLabels (asmCode : String) : List (String × UInt64) :=
+  let lines := asmCode.splitOn "\n"
+  let (result, _, _) := lines.foldl (fun (acc, inData, pendingLabel) line =>
+    let trimmed := line.trim
+    if trimmed.startsWith ".data" then (acc, true, pendingLabel)
+    else if trimmed.startsWith ".text" then (acc, false, none)
+    else if !inData then (acc, inData, pendingLabel)
+    else if trimmed.isEmpty || trimmed.startsWith "#" ||
+            trimmed.startsWith ".align" || trimmed.startsWith ".globl" ||
+            trimmed.startsWith ".type" || trimmed.startsWith ".size" ||
+            trimmed.startsWith ".space" then
+      (acc, inData, pendingLabel)
+    else if trimmed.contains ':' then
+      let parts := trimmed.splitOn ":"
+      let label := (parts[0]? |>.getD "").trim
+      let rest  := (parts.drop 1 |> String.intercalate ":").trim
+      if rest.isEmpty || rest.startsWith "#" then
+        -- label-only line
+        (acc, inData, some label)
+      else if rest.startsWith ".quad " then
+        let valStr := (rest.drop 6).trim
+        match valStr.toInt? with
+        | some v => (acc ++ [(label, UInt64.ofInt v)], inData, none)
+        | none   => (acc, inData, none)
+      else
+        (acc, inData, some label)
+    else if trimmed.startsWith ".quad " then
+      let valStr := (trimmed.drop 6).trim
+      match pendingLabel, valStr.toInt? with
+      | some lbl, some v => (acc ++ [(lbl, UInt64.ofInt v)], inData, none)
+      | _, _             => (acc, inData, pendingLabel)
+    else
+      (acc, inData, pendingLabel)
+  ) ([], false, none)
+  result
+
+/-- Build a MachineState from a parsed Program and data labels.
+    Instructions are placed at addresses 0, 1, 2, … (1-byte-per-instruction TODO).
+    Data labels are placed at 8-byte-aligned addresses after the instruction region. -/
+def buildMachineStateWithData (prog : Program) (dataLabels : List (String × UInt64)) : MachineState :=
+  let s := programToMachineState prog
+  -- Data starts at the first 8-byte-aligned address after all instructions
+  let dataBase := ((prog.length.toUInt64 + 7) / 8) * 8
+  let (mem', lbls', _) := dataLabels.foldl (fun (m, a, off) (lbl, val) =>
+    let addr := dataBase + off.toUInt64
+    let m' := m.insert addr (.data val)
+    let a' := a.insert lbl addr
+    (m', a', off + 8)
+  ) (s.memory, s.labelAddrs, 0)
+  { s with memory := mem', labelAddrs := lbls' }
+
 /-- Run assembly through Kraken's semantics.
-    Returns the final machine state after execution. -/
+    Extracts testable instructions (between _start: and jmp _kraken_capture)
+    plus data label values from the .data section, builds a MachineState,
+    and evaluates until the program terminates. -/
 def runKraken (asmCode : String) (initState : MachineState := {})
     : Except String MachineState := do
-  let prog ← Parser.parse asmCode
-  runBounded prog initState 10000
+  let testCode := extractTestableCode asmCode
+  let dataLabels := extractDataLabels asmCode
+  let prog ← Parser.parse testCode
+  let s := buildMachineStateWithData prog dataLabels
+  -- Overlay any caller-supplied initial register/flag state
+  let s := { s with regs := initState.regs, flags := initState.flags }
+  runBounded s 10000
 where
-  runBounded (prog : Program) (s : MachineState) (fuel : Nat) : Except String MachineState :=
+  runBounded (s : MachineState) (fuel : Nat) : Except String MachineState :=
     match fuel with
     | 0 => .error "execution exceeded step limit"
     | fuel' + 1 =>
-      if s.rip >= prog.length then .ok s
-      else
-        match eval1 (m := { throw := Except.error }) prog s (fun s => .ok s) with
-        | .ok s' => runBounded prog s' fuel'
+      -- Stop when the PC points past the instruction region (program has terminated)
+      match (s.memory[s.rip]? : Option MemCell) with
+      | some (.instr _ _) =>
+        match eval1 (m := { throw := Except.error }) s (fun s => .ok s) with
+        | .ok s' => runBounded s' fuel'
         | .error e => .error e
+      | _ => .ok s
 
 -- ============================================================================
 -- Test Result Type
@@ -359,7 +441,7 @@ def compareStatesWithMem (krakenState : MachineState)
     : TestResult :=
   let regDiffs := compareRegisters krakenState.regs actualRegs
   let flagDiffs := compareFlags krakenState.flags actualFlags
-  let expectedMem := extractKrakenMemory krakenState.heap memRegions
+  let expectedMem := extractKrakenMemory krakenState.memory memRegions
   let memDiffs := compareMemory expectedMem actualMem
   let allDiffs := regDiffs ++ flagDiffs ++ memDiffs
   if allDiffs.isEmpty then .success
@@ -368,25 +450,6 @@ def compareStatesWithMem (krakenState : MachineState)
 -- ============================================================================
 -- High-Level Test API
 -- ============================================================================
-
-/-- Extract testable instructions from assembly code.
-    Looks for code between _start: and jmp _kraken_capture,
-    filtering out directives and comments. -/
-def extractTestableCode (asmCode : String) : String :=
-  let lines := asmCode.splitOn "\n"
-  let inTest := lines.foldl (fun (acc, inBlock) line =>
-    let trimmed := line.trim
-    if trimmed.startsWith "_start:" then (acc, true)
-    else if inBlock && trimmed.startsWith "jmp" && trimmed.endsWith "_kraken_capture" then
-      (acc, false)
-    else if inBlock then
-      -- Skip directives, empty lines, and comment-only lines
-      let isDirective := trimmed.startsWith "." || trimmed.isEmpty || trimmed.startsWith "#"
-      if isDirective then (acc, inBlock)
-      else (acc ++ [line], inBlock)
-    else (acc, inBlock)
-  ) ([], false)
-  String.intercalate "\n" inTest.1
 
 /-- Run a complete test: parse AS output, run Kraken eval, compare results.
 
@@ -400,18 +463,10 @@ def runTest (asmCode : String) (asOutput : ByteArray) : TestResult :=
   match parseRegisterState asOutput with
   | none => .execError "Failed to parse AS output (need 136 bytes)"
   | some (actualRegs, actualFlags) =>
-    -- Extract testable code
-    let testCode := extractTestableCode asmCode
-    if testCode.isEmpty then
-      -- If no markers found, try using the whole file
-      match runKraken asmCode with
-      | .error e => .krakenError e
-      | .ok krakenState => compareStates krakenState actualRegs actualFlags
-    else
-      -- Run extracted code through Kraken
-      match runKraken testCode with
-      | .error e => .krakenError s!"Error running extracted code: {e}"
-      | .ok krakenState => compareStates krakenState actualRegs actualFlags
+    -- Pass full assembly to runKraken; it handles extraction and data-label parsing internally
+    match runKraken asmCode with
+    | .error e => .krakenError e
+    | .ok krakenState => compareStates krakenState actualRegs actualFlags
 
 /-- Format a TestResult for display. -/
 def TestResult.toString : TestResult → String
