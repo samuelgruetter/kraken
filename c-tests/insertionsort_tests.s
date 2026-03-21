@@ -1,4 +1,9 @@
 	.file	"insertionsort_tests.c"
+# GNU C17 (Ubuntu 13.3.0-6ubuntu2~24.04.1) version 13.3.0 (x86_64-linux-gnu)
+#	compiled by GNU C version 13.3.0, GMP version 6.3.0, MPFR version 4.2.1, MPC version 1.3.1, isl version isl-0.26-GMP
+
+# GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072
+# options passed: -m64 -mtune=generic -march=x86-64 -O2 -ffreestanding -fno-stack-protector -fno-pic -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection
 	.text
 	.p2align 4
 	.globl	_start
@@ -6,30 +11,35 @@
 _start:
 .LFB2:
 	.cfi_startproc
-	endbr64
-	pushq	%rax
+	endbr64	
+	pushq	%rax	#
 	.cfi_def_cfa_offset 16
-	popq	%rax
+	popq	%rax	#
 	.cfi_def_cfa_offset 8
-	movl	$5, %esi
-	movl	$test_array, %edi
-	subq	$8, %rsp
+# insertionsort_tests.c:28:     insertionsort(test_array, 5);
+	movl	$5, %esi	#,
+	movl	$test_array, %edi	#,
+# insertionsort_tests.c:27: void _start(void) {
+	subq	$8, %rsp	#,
 	.cfi_def_cfa_offset 16
-	call	insertionsort
-	movl	$1, %eax
-	movl	$test_array, %esi
-	movl	$40, %edx
-	movq	%rax, %rdi
+# insertionsort_tests.c:28:     insertionsort(test_array, 5);
+	call	insertionsort	#
+# insertionsort_tests.c:9:     __asm__ volatile (
+	movl	$1, %eax	#, tmp82
+	movl	$test_array, %esi	#, tmp84
+	movl	$40, %edx	#, tmp85
+	movq	%rax, %rdi	# tmp82, tmp82
 #APP
 # 9 "insertionsort_tests.c" 1
-	syscall
+	syscall	
 # 0 "" 2
+# insertionsort_tests.c:18:     __asm__ volatile (
 #NO_APP
-	movl	$60, %eax
-	xorl	%edi, %edi
+	movl	$60, %eax	#, tmp86
+	xorl	%edi, %edi	# tmp87
 #APP
 # 18 "insertionsort_tests.c" 1
-	syscall
+	syscall	
 # 0 "" 2
 #NO_APP
 	.cfi_endproc
