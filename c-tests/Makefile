@@ -1,5 +1,5 @@
 CC     = gcc
-CFLAGS = -O2 -ffreestanding -nostdlib -nostartfiles -fno-stack-protector -fno-pie -fno-pic -m64
+CFLAGS = -O2 -ffreestanding -nostdlib -nostartfiles -fno-stack-protector -fno-pie -fno-pic -m64 -fverbose-asm
 SRCS   = insertionsort.c insertionsort_tests.c
 OBJS   = insertionsort.o insertionsort_tests.o
 ASM    = insertionsort.s insertionsort_tests.s
