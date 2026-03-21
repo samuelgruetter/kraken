@@ -8,3 +8,7 @@ name = "Kraken"
 [[lean_exe]]
 name = "krakentest"
 root = "KrakenTest"
+
+[[lean_exe]]
+name = "mkcinsertionsorttest"
+root = "Kraken.CTests.MkInsertionsortTest"
