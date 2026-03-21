@@ -405,7 +405,7 @@ where
     | fuel' + 1 =>
       -- Stop when the PC points past the instruction region (program has terminated)
       match (s.memory[s.rip]? : Option MemCell) with
-      | some (.instr _ _) =>
+      | some (MemCell.instr ..) =>
         match eval1 (m := { throw := Except.error }) s (fun s => .ok s) with
         | .ok s' => runBounded s' fuel'
         | .error e => .error e

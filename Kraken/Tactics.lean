@@ -14,8 +14,6 @@ import Kraken.Theorems
 
 def Post := MachineState → Prop
 
--- step1: evaluate one step from state s, yielding post-condition.
--- The program is now contained in s.memory, so no separate Program parameter is needed.
 def step1 (s: MachineState) (post: Post) :=
   eval1 (m:={ throw _ := False }) s post
 

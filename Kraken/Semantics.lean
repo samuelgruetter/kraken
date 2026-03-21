@@ -272,8 +272,8 @@ def Instr.is_ctrl
     Data cells live at 8-byte-aligned addresses; instruction cells at sequential byte addresses.
     TODO: We assume each instruction occupies 1 byte. Real x86 instructions are 1–15 bytes. -/
 inductive MemCell
-  | data  (v : Word)                        -- 64-bit data word in the data region
-  | instr (label : Option Label) (i : Instr) -- instruction (with optional label) in code region
+  | data  (v : Word)    -- 64-bit data word in the data region
+  | instr (i : Instr)   -- instruction in the code region (labels are in MachineState.labelAddrs)
   deriving Repr
 
 -- ============================================================================
@@ -300,8 +300,7 @@ instance : Repr (Std.HashMap String UInt64) where
 /-- Machine state: registers, flags, instruction pointer, and unified memory.
     The program (instructions) is stored in memory at sequential byte addresses
     starting from 0, alongside data at 8-byte-aligned addresses.
-    All functions that previously took a separate (p : Program) parameter now
-    take (s : MachineState) instead, since the program lives in s.memory. -/
+    The program (instructions) lives in s.memory; labels are in s.labelAddrs. -/
 structure MachineState where
   regs      : Registers := {}
   flags     : Flags := {}
@@ -458,14 +457,19 @@ def MachineState.readMem [Throw α] (s : MachineState) (addr : Address) (ret: Wo
   else
     match s.memory[addr]? with
     | .some (.data v) => ret v
-    | .some (.instr _ _) => throw (s!"Data read from code region (rip={repr s.rip}, addr={repr addr})")
+    | .some (.instr _) => throw (s!"Data read from code region (rip={repr s.rip}, addr={repr addr})")
     | .none => throw (s!"Memory read but not written to (rip={repr s.rip}, addr={repr addr})")
 
 def MachineState.writeMem [Throw α] (s : MachineState) (addr : Address) (val : Word) (ret: MachineState → α) : α :=
   if addr % 8 != 0 then
     throw s!"Out-of-bounds access (rip={repr s.rip})"
   else
-    ret { s with memory := s.memory.insert addr (.data val) }
+    -- Check that the 7 sub-word bytes are unoccupied (no partial overlap with another cell)
+    let clear := (List.range 7).all fun k => (s.memory[addr + (k + 1).toUInt64]?).isNone
+    if !clear then
+      throw s!"Overlapping write: bytes addr+1..addr+7 must be unoccupied (addr={repr addr})"
+    else
+      ret { s with memory := s.memory.insert addr (.data val) }
 
 -- Sign-extension helpers: use standard integer type conversions
 -- Strategy: truncate to input size → signed Int conversion → convert to UInt64
@@ -1138,36 +1142,29 @@ def ctrl [Throw α] (s: MachineState) (lookup: Label → (UInt64 → α) → α)
     TODO: Each instruction is assumed to be 1 byte. Real x86 instructions are variable-size. -/
 abbrev Program := List (Option Label × Instr)
 
-/-- Look up a label's address in the machine state's label table.
-    Previously took a (p: Program) parameter; now uses (s: MachineState) since
-    the program and its labels are stored in s.memory / s.labelAddrs. -/
+/-- Look up a label's address in the machine state's label table. -/
 def lookup [Throw α] (s: MachineState) (l: Label) (ret: UInt64 → α): α :=
   match s.labelAddrs[l]? with
   | .some addr => ret addr
   | .none => throw s!"Invalid label: {repr l}"
 
-/-- Fetch the instruction at the current RIP from memory.
-    Previously took a (p: Program) parameter; now uses (s: MachineState) since
-    instructions are stored in s.memory. -/
-def fetch [Throw α] (s: MachineState) (ret: (Option Label × Instr) → α): α :=
+/-- Fetch the instruction at the current RIP from memory. -/
+def fetch [Throw α] (s: MachineState) (ret: Instr → α): α :=
   match s.memory[s.rip]? with
-  | .some (.instr lbl i) => ret (lbl, i)
+  | .some (.instr i) => ret i
   | .some (.data _) => throw s!"PC points to data region (rip={repr s.rip})"
   | .none => throw s!"PC outside program bounds (rip={repr s.rip})"
 
-/-- Evaluate one instruction step.
-    Previously took a (p: Program) parameter; now takes only (s: MachineState)
-    since the program lives in s.memory and labels in s.labelAddrs. -/
+/-- Evaluate one instruction step. -/
 def eval1 [m: Throw α] (s: MachineState) (ret: MachineState → α): α :=
-  fetch s (fun (_, i) =>
+  fetch s (fun i =>
     if i.is_ctrl then
       ctrl s (lookup s) i ret
     else
       strt1 s i (fun s =>
       ret (next s)))
 
-/-- Evaluate until termination (no fuel limit — use runBounded in TestHarness).
-    Previously took a (p: Program) parameter; now takes only (s: MachineState). -/
+/-- Evaluate until termination (no fuel limit — use runBounded in TestHarness). -/
 def eval (s: MachineState): Option MachineState := do
   let s ← (eval1 (m:={ throw _ := Option.none }) s) (fun s => .some s)
   eval s
@@ -1184,7 +1181,7 @@ def readDataCell (mem : Memory) (addr : Address) : Option Word :=
     TODO: Each instruction occupies 1 byte in this model; real x86 instructions are variable-size. -/
 def programToMachineState (p : Program) : MachineState :=
   let (mem, lbls) := p.zipIdx.foldl (fun (m, a) ((lbl, instr), i) =>
-    let m' := m.insert i.toUInt64 (.instr lbl instr)
+    let m' := m.insert i.toUInt64 (.instr instr)
     let a' := match lbl with
       | some l => a.insert l i.toUInt64
       | none   => a
