@@ -2,5 +2,6 @@
 .vimsession
 # Build artifacts from test runs
 *.o
+*.exe
 asm-tests/test
 .vscode/settings.json

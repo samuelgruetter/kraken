@@ -6,7 +6,7 @@ ASM    = insertionsort.s insertionsort_tests.s
 
 .PHONY: all test clean
 
-all: $(ASM) insertionsort_tests
+all: $(ASM) insertionsort_tests.exe
 
 %.s: %.c
 	$(CC) $(CFLAGS) -S -o $@ $<
@@ -14,13 +14,13 @@ all: $(ASM) insertionsort_tests
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-insertionsort_tests: $(OBJS)
+insertionsort_tests.exe: $(OBJS)
 	ld -o $@ $(OBJS)
 
-test: insertionsort_tests
-	./insertionsort_tests > /tmp/isort_actual.bin
+test: insertionsort_tests.exe
+	./insertionsort_tests.exe > /tmp/isort_actual.bin
 	python3 -c "import struct, sys; sys.stdout.buffer.write(struct.pack('<5q', -1000000000000, -5, 42, 42, 1000000000000))" > /tmp/isort_expected.bin
 	cmp /tmp/isort_actual.bin /tmp/isort_expected.bin && echo "PASS" || (echo "FAIL"; exit 1)
 
 clean:
-	rm -f $(OBJS) $(ASM) insertionsort_tests /tmp/isort_actual.bin /tmp/isort_expected.bin
+	rm -f $(OBJS) $(ASM) insertionsort_tests.exe *_instrumented.s /tmp/isort_actual.bin /tmp/isort_expected.bin

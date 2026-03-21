@@ -5,7 +5,7 @@ Implements steps 1 and 2 of the WORKFLOW FOR MEMORY TESTING in Kraken/TestHarnes
   1. Define memory regions to track (test_array: 5 int64_t values)
   2. Generate test program with memory tracking via Kraken.TestHarness.wrapAssembly
 
-Output: ctests/insertionsort_tests_instrumented.s
+Output: c-tests/insertionsort_tests_instrumented.s
 
 The instrumented .s contains:
   - Kraken capture preamble (.data section for registers + memory region metadata)
@@ -79,5 +79,5 @@ def main : IO Unit := do
     -- Capture epilogue: _kraken_capture label, save registers, copy memory, write, exit
     genCaptureEpilogue memRegions
 
-  IO.FS.writeFile "ctests/insertionsort_tests_instrumented.s" instrumented
-  IO.println "Generated ctests/insertionsort_tests_instrumented.s"
+  IO.FS.writeFile "c-tests/insertionsort_tests_instrumented.s" instrumented
+  IO.println "Generated c-tests/insertionsort_tests_instrumented.s"
