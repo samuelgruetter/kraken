@@ -17,6 +17,16 @@ open Std.Internal.Parsec
 open Std.Internal.Parsec.String
 
 -- ============================================================================
+-- Generic Combinators
+-- ============================================================================
+
+def sepBy {α} (p : Parser α) (sep : Parser Unit) : Parser (Array α) :=
+  (do
+    let hd ← p
+    let tl ← many (do sep; p)
+    pure (#[hd] ++ tl)) <|> pure #[]
+
+-- ============================================================================
 -- Lexical Utilities
 -- ============================================================================
 
@@ -394,8 +404,10 @@ def Option.toParser {T} (self: Option T): Parser T :=
 instance {T} : Coe (Option T) (Parser T) where coe := Option.toParser
 
 /-- Parse an instruction mnemonic and its operands.
-    AT&T syntax: src, dst (reversed from Intel). -/
-def parseInstr : Parser Instr := do
+    AT&T syntax: src, dst (reversed from Intel).
+    The `lenient` flag controls whether to reject unknown instructions (false)
+    or to parse them as a .generic instruction (true). -/
+def parseInstr (lenient : Bool): Parser Instr := do
   skipHWs
   let mnemonic ← parseName
   let mn := mnemonic.toLower
@@ -785,7 +797,13 @@ def parseInstr : Parser Instr := do
       let cc ← parseCondCode (mn.drop 4)
       commaSeparated .none parseRegOrMem parseReg (.cmovcc cc)
     else
-      fail s!"unsupported instruction: {mnemonic}"
+      if lenient then
+        let w ← instrWidth mn <|> pure .W64
+        skipHWs
+        let operands ← sepBy (parseOperandWithType w) parseComma
+        pure ⟨ w, w, .generic mn operands.toList ⟩
+      else
+        fail s!"unsupported instruction: {mnemonic}"
 
 -- ============================================================================
 -- Label Parsing
@@ -807,7 +825,7 @@ def parseLabelDecl : Parser Label := do
 
 /-- Parse a single line: optional label, followed by optional instruction or directive.
     Returns a list of directives found on the line. -/
-def parseLine : Parser (List Directive) := do
+def parseLine (lenient : Bool): Parser (List Directive) := do
   skipHWs
   let c ← peek!
   -- Skip empty lines and comment-only lines
@@ -838,7 +856,7 @@ def parseLine : Parser (List Directive) := do
           ) <|> pure none
           pure (some (Directive.instr ⟨ .W64, .W64, .nopalign alignment.toNat pad ⟩))
         ) <|> (do
-          let instr ← parseInstr
+          let instr ← parseInstr lenient
           pure (some (Directive.instr instr)))
     ) <|> pure none
     match label, instr with
@@ -847,24 +865,32 @@ def parseLine : Parser (List Directive) := do
     | none,   some i => pure [i]
     | none,   none   => pure []
 
--- ============================================================================
--- Public API
--- ============================================================================
-
 instance {T1} : Coe (ParseResult (List T1) (Sigma String.Pos)) (Except String (List T1)) where coe :=
   fun r => match r with
   | .success _ v => .ok v
   | .error _ .eof => .ok []
   | .error _ (.other msg) => .error msg
 
-def parse (input: String) : Except String Program := do
+/-- The `lenient` flag controls whether to reject unknown instructions (false)
+    or to parse them as a .generic instruction (true). -/
+def parse_generic (lenient : Bool) (input: String) : Except String Program := do
   let rawLines := (input.splitOn "\n")
   let (_, lines) ← rawLines.foldlM (fun (lineNum, acc) x => do
-    match (parseLine ⟨ x, x.startPos ⟩ : Except String (List Directive)) with
+    match (parseLine lenient ⟨ x, x.startPos ⟩ : Except String (List Directive)) with
     | .ok v => pure (lineNum + 1, v :: acc)
     | .error msg => .error s!"line {lineNum}: {msg}"
   ) ((1 : Nat), [])
   pure lines.reverse.flatten
+
+-- ============================================================================
+-- Public API
+-- ============================================================================
+
+/-- Parses a program, rejecting unknown instructions -/
+def parse : String → Except String Program := parse_generic false
+
+/-- Parses a program, representing unknown instructions as .generic -/
+def parse_lenient : String → Except String Program := parse_generic true
 
 /-- A version of `parse` that runs at compile-time. -/
 elab "parse(" s:str ")" : term => do
