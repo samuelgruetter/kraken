@@ -26,7 +26,7 @@ example [layout : Layout] s : step1 (layout p1) (s, layout.start) (fun s => s.1.
   dsimp only [step1,Executable.straightline]
   rw [Executable.directivesFromStart]
   simp [List.mapIdx,List.mapIdx.go]
-  dsimp only [Directives.interp,Directive.interp,Instr.interp,Operation.interp,Operand.interp,RegOrMem.interp]
+  dsimp only [Directives.interp,Directive.interp,Instr.interp,Operation.interp,Operand.full_interp,RegOrMem.full_interp]
   dsimp only [MachineData.set,Reg64s.set,MachineData.setReg,Reg64s.set64,ConstExpr.interp,Effects.all]
   simp (ground:=True)
   dsimp only [Effects.all]
@@ -85,7 +85,7 @@ example [layout : Layout] (s : MachineData): Eventually (layout p2) (fun s => s.
   dsimp only [step1,Executable.straightline]
   rw [Executable.directivesFromStart]
   simp [List.mapIdx,List.mapIdx.go]
-  dsimp only [Directives.interp,Directive.interp,Instr.interp,Operation.interp,Operand.interp,RegOrMem.interp]
+  dsimp only [Directives.interp,Directive.interp,Instr.interp,Operation.interp,Operand.full_interp,Operand.interp,RegOrMem.full_interp,RegOrMem.interp]
   dsimp only [MachineData.set,Reg64s.set,MachineData.setReg,Reg64s.set64,ConstExpr.interp,CondCode.interp,StatusFlags.from_result, Effects.all]
   simp only [Int64.toBitVec_ofNat, BitVec.ofNat_eq_ofNat, BitVec.truncate_eq_setWidth, BitVec.xor_self, BitVec.zero_eq,
     BEq.rfl, Bool.not_true, Bool.false_eq_true, ↓reduceIte, BitVec.setWidth_zero, BitVec.msb_zero]
