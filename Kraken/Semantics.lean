@@ -384,6 +384,8 @@ inductive Operation (w : Width)
   -- TODO: optiona third argument, with the caveat that `.align 16,,0` is valid
   -- syntax
   | nopalign (alignment : Nat) (pad : Option Nat)
+  -- catch-all for unknown/not explicitly modeled instruction
+  | generic (mnemonic : String) (operands : List (Operand w))
   deriving Repr, DecidableEq, Hashable, Lean.ToExpr
 
 structure StatusFlags.from_result.Remaining where
@@ -693,6 +695,7 @@ def Operation.interp [Labels] [address_size : AddressSize]
     s.simple_load rsp .W64 (fun ra =>
     jmp (.ofBitVec ra) { s with regs := s.regs.set64 .rsp (rsp + 8) })
   | nop _ | nopalign _ _ => next s
+  | .generic .. => unimplemented s!"unsupported generic instruction"
 
 structure Instr where
   address_size : Width
