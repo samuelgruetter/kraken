@@ -73,4 +73,4 @@ def run_and_get_error (prog : String): String :=
 -- #eval runKraken swap_bells_and_whistles
 
 -- example : run_and_get_bells_and_whistles swap_bells_and_whistles = (43, 42) := by native_decide
-example : run_and_get_error swap_bells_and_whistles = "unsupported generic instruction" := by native_decide
+example : run_and_get_error swap_bells_and_whistles = "unsupported instruction { address_size := Width.W64, operation_size := Width.W64, operation := Operation.generic \"rdbells\" [] }" := by native_decide
