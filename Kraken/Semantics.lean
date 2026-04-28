@@ -94,6 +94,8 @@ structure MachineData where -- does not include code or program position
   dmem : DataMem := ∅
   deriving Repr, BEq, DecidableEq
 
+abbrev MachineState := MachineData × Int64
+
 -- We only allow nondeterministic choices for a fixed set of types.
 class inductive NondetSupportingType : Type -> Type
   | bitvec (w : Width) : NondetSupportingType w.type
@@ -111,10 +113,13 @@ instance : NondetSupportingType Bool := .bool
 instance : NondetSupportingType StatusFlags := .statusFlags
 
 inductive Effects
-  | done (a : MachineData × Int64)
+  | done (s : MachineState)
   | undefined (msg : String)
   | unimplemented (msg : String)
-  | unsupported_instruction (instr : Instr)
+  -- TODO add rip to the data that the effect handler can modify so that
+  -- unsupported instructions can be handled by jumping to some handler,
+  -- and make sure Instr.interp can deal with an arbitratily changed rip
+  | unsupported_instruction (s : MachineData) (instr : Instr) (resume : MachineData → Effects)
   -- loads and stores *outside* the data memory, eg. MMIO, might still affect the data memory:
   -- for instance, MMIO reads/writes at certain device register addresses might change what
   -- data memory the process logically owns vs what memory is owned by devices
@@ -560,7 +565,8 @@ def Instr.interp [Labels]
     if allowed
     then Operation.interp
             (w := i.operation_size) (address_size := .mk i.address_size)
-            i.operation p s next jmp (Effects.unsupported_instruction i)
+            i.operation p s next jmp
+            (Effects.unsupported_instruction s i next)
     else .undefined s!"No exec permissions at {repr p.lower}..{repr p.upper}")
 
 def Directive.interp [Labels]
@@ -621,8 +627,6 @@ def Executable.directivesFromAddress (e : Executable) (a : Int64) : List (Direct
 def Executable.directivesFromLabel (e : Executable) (l : Label) : List (Directive × Nat) :=
   e.2.dropWhile (·.1 != .label l)
 
-abbrev MachineState := MachineData × Int64
-
 def Executable.step (e : Executable) (s : MachineState) (ret : MachineState → Effects) : Effects :=
   let := e.labels
   Directives.interp (e.directivesAtAddress s.2) s.1 s.2 (fun pc s => ret (s, pc))
@@ -641,7 +645,7 @@ where
     | .done s => eval e s until_
     | .undefined msg => .error msg
     | .unimplemented msg => .error msg
-    | .unsupported_instruction i => .error s!"unsupported instruction {repr i}"
+    | .unsupported_instruction _ i _ => .error s!"unsupported instruction {repr i}"
     | .can_read _ _ cont => handle_effects (cont true)
     | .can_write _ _ cont => handle_effects (cont true)
     | .can_exec _ cont => handle_effects (cont true)
