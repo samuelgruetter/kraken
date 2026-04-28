@@ -114,6 +114,7 @@ inductive Effects
   | done (a : MachineData × Int64)
   | undefined (msg : String)
   | unimplemented (msg : String)
+  | unsupported_instruction (instr : Instr)
   -- loads and stores *outside* the data memory, eg. MMIO, might still affect the data memory:
   -- for instance, MMIO reads/writes at certain device register addresses might change what
   -- data memory the process logically owns vs what memory is owned by devices
@@ -269,7 +270,8 @@ def StatusFlags.from_result {w} (result : BitVec w) (f : from_result.Remaining) 
 set_option maxHeartbeats 1000000
 def Operation.interp [Labels] [address_size : AddressSize]
   {w} (i : Operation w) (p : Std.Rco Int64) (s : MachineData)
-  (next : MachineData → Effects) (jmp : Int64 → MachineData → Effects) : Effects :=
+  (next : MachineData → Effects) (jmp : Int64 → MachineData → Effects)
+  (unsupported : Effects) : Effects :=
   match (generalizing := false) (motive := Operation w → Effects) i with
   | .mov dst src => src.full_interp s p (fun val dmem' =>
       { s with dmem := dmem' }.set dst val p next)
@@ -549,14 +551,16 @@ def Operation.interp [Labels] [address_size : AddressSize]
     s.simple_load rsp .W64 (fun ra =>
     jmp (.ofBitVec ra) { s with regs := s.regs.set64 .rsp (rsp + 8) })
   | nop _ | nopalign _ _ => next s
-  | .generic .. => unimplemented s!"unsupported generic instruction"
+  | .generic .. => unsupported
 
 def Instr.interp [Labels]
   (i : Instr) (s : MachineData) (p : Std.Rco Int64)
   (next : MachineData → Effects) (jmp : Int64 → MachineData → Effects) : Effects :=
   can_exec p (fun allowed =>
     if allowed
-    then Operation.interp (w := i.operation_size ) (address_size := .mk i.address_size) i.operation p s next jmp
+    then Operation.interp
+            (w := i.operation_size) (address_size := .mk i.address_size)
+            i.operation p s next jmp (Effects.unsupported_instruction i)
     else .undefined s!"No exec permissions at {repr p.lower}..{repr p.upper}")
 
 def Directive.interp [Labels]
@@ -637,6 +641,7 @@ where
     | .done s => eval e s until_
     | .undefined msg => .error msg
     | .unimplemented msg => .error msg
+    | .unsupported_instruction i => .error s!"unsupported instruction {repr i}"
     | .can_read _ _ cont => handle_effects (cont true)
     | .can_write _ _ cont => handle_effects (cont true)
     | .can_exec _ cont => handle_effects (cont true)
