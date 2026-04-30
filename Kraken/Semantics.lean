@@ -16,6 +16,7 @@ def BitVec.take {w} (x : BitVec w) (n : Nat) : BitVec n := x.extractLsb' 0 n
 def BitVec.drop {w} (x : BitVec w) (n : Nat) : BitVec (w - n) := x.extractLsb' n (w-n)
 def BitVec.replaceLow {w n} (old : BitVec w) (new : BitVec n) : BitVec w :=
   (BitVec.append (old.drop n) new).setWidth _
+/-- `old.replace i new` replaces the bits at index `i` and higher by `new` -/
 def BitVec.replace {w1} (old : BitVec w1) (i : Nat) {w2} (new : BitVec w2) : BitVec w1 :=
   (old.extractLsb' (i + w2) (w1 - w2 - i) ++ new ++ old.extractLsb' 0 i).setWidth _
 
@@ -117,9 +118,9 @@ inductive Effects
   | undefined (msg : String)
   | unimplemented (msg : String)
   -- TODO add rip to the data that the effect handler can modify so that
-  -- unsupported instructions can be handled by jumping to some handler,
+  -- unimplemented instructions can be handled by jumping to some handler,
   -- and make sure Instr.interp can deal with an arbitratily changed rip
-  | unsupported_instruction (s : MachineData) (instr : Instr) (resume : MachineData → Effects)
+  | unimplemented_instruction (s : MachineData) (instr : Instr) (resume : MachineData → Effects)
   -- loads and stores *outside* the data memory, eg. MMIO, might still affect the data memory:
   -- for instance, MMIO reads/writes at certain device register addresses might change what
   -- data memory the process logically owns vs what memory is owned by devices
@@ -129,7 +130,7 @@ inductive Effects
   | can_read (addr : BitVec 64) (w : Width) (cont : Bool → Effects)
   | can_write (addr : BitVec 64) (w : Width) (cont : Bool → Effects)
   | can_exec (p: Std.Rco Int64) (cont : Bool → Effects)
-export Effects (nonmem_load nonmem_store undefined unimplemented pick can_read can_write can_exec)
+export Effects (unimplemented_instruction nonmem_load nonmem_store pick can_read can_write can_exec)
 
 -- the unused `Std.Rco Int64` argument and the unmodified `MachineData` return
 -- value are present for uniformity with RegOrMem.interp
@@ -154,7 +155,7 @@ def MachineData.load
   (ret : w.type → MachineData → Effects): Effects :=
   if addr % w.bytesv != 0 then .unimplemented s!"Unimplemented: only aligned memory access is supported"
   else can_read addr w (fun allowed =>
-    if !allowed then .undefined s!"Memory read of {repr w} not allowed at address {repr addr}"
+    if !allowed then .unimplemented s!"Memory read of {repr w} not allowed at address {repr addr}"
     else let key := UInt64.ofBitVec (addr &&& ~~~0b111#64)
     match s.dmem[key]? with
     | .some v => ret (v.toBitVec.extractLsb' ((addr &&& 0b111#64) * 8#64).toNat w.bits) s
@@ -548,7 +549,7 @@ def Instr.interp [Labels]
     then Operation.interp
             (w := i.operation_size) (address_size := .mk i.address_size)
             i.operation p s next jmp
-            (Effects.unsupported_instruction s i next)
+            (unimplemented_instruction s i next)
     else .undefined s!"No exec permissions at {repr p.lower}..{repr p.upper}")
 
 def Directive.interp [Labels]
@@ -627,7 +628,7 @@ where
     | .done s => eval e s until_
     | .undefined msg => .error msg
     | .unimplemented msg => .error msg
-    | .unsupported_instruction _ i _ => .error s!"unsupported instruction {repr i}"
+    | unimplemented_instruction _ i _ => .error s!"unsupported instruction {repr i}"
     | .can_read _ _ cont => handle_effects (cont true)
     | .can_write _ _ cont => handle_effects (cont true)
     | .can_exec _ cont => handle_effects (cont true)

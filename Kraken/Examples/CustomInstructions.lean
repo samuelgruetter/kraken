@@ -48,7 +48,7 @@ def handle_effects (extra : ExtraState) (es : Effects)
   | .done ms => ok (.mk ms extra)
   | .undefined msg => .error msg
   | .unimplemented msg => .error msg
-  | .unsupported_instruction s i resume =>
+  | unimplemented_instruction s i resume =>
        handle_bells_and_whistles s extra i (fun s' extra' =>
          handle_effects extra' (resume s') ok)
   | .can_read _ _ cont => handle_effects extra (cont true) ok

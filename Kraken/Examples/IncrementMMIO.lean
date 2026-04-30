@@ -91,7 +91,7 @@ def handle_effects (ds : IncrementerState) (es : Effects)
   | .done ms => ok (.mk ms ds)
   | .undefined msg => .error msg
   | .unimplemented msg => .error msg
-  | .unsupported_instruction _ i _ => .error s!"unsupported instruction {repr i}"
+  | unimplemented_instruction _ i _ => .error s!"unsupported instruction {repr i}"
   | .can_read _ _ cont => handle_effects ds (cont true) ok
   | .can_write _ _ cont => handle_effects ds (cont true) ok
   | .can_exec _ cont => handle_effects ds (cont true) ok
