@@ -100,6 +100,10 @@ info: [Directive.instr
   movq $0, %rax
 loop:
   addq $1, %rax
+
+  # instructions with missing arguments ignored??
+  addq
+
   cmpq $10, %rax
   jne loop
 ")

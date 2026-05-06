@@ -819,17 +819,20 @@ def parseLabelDecl : Parser Label := do
     Returns a list of directives found on the line. -/
 def parseLine : Parser (List Directive) := do
   skipHWs
+  /-
   let c ← peek!
   -- Skip empty lines and comment-only lines
   if c == '\n' || c == '#' then
     if c == '#' then skipLineComment
     pure []
   else
+  -/
     let label ← (attempt do
       let l ← parseLabelDecl
       pure (some (Directive.label l))) <|> pure none
     skipHWs
     let instr ← (do
+      /-
       let c ← peek!
       if c == '\n' || c == '#' then
         pure none
@@ -847,7 +850,7 @@ def parseLine : Parser (List Directive) := do
             pure (some pad.toNat)
           ) <|> pure none
           pure (some (Directive.instr ⟨ .W64, .W64, .nopalign alignment.toNat pad ⟩))
-        ) <|> (do
+        ) <|>-/ (do
           let instr ← parseInstr
           pure (some (Directive.instr instr)))
     ) <|> pure none
