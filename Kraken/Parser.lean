@@ -857,6 +857,9 @@ def parseLine : Parser (List Directive) := do
     | none,   some i => pure [i]
     | none,   none   => pure []
 
+def runStringParser {α} (p : Parser α) (input : String) : ParseResult α (Sigma String.Pos) :=
+  p ⟨ input, input.startPos ⟩
+
 -- ============================================================================
 -- Public API
 -- ============================================================================
@@ -867,14 +870,16 @@ instance {T1} : Coe (ParseResult (List T1) (Sigma String.Pos)) (Except String (L
   | .error _ .eof => .ok []
   | .error _ (.other msg) => .error msg
 
-def parse (input: String) : Except String Program := do
+def parseLines {α} (oneLine : Parser (List α)) (input: String) : Except String (List α) := do
   let rawLines := (input.splitOn "\n")
   let (_, lines) ← rawLines.foldlM (fun (lineNum, acc) x => do
-    match (parseLine ⟨ x, x.startPos ⟩ : Except String (List Directive)) with
+    match (runStringParser oneLine x : Except String (List α)) with
     | .ok v => pure (lineNum + 1, v :: acc)
     | .error msg => .error s!"line {lineNum}: {msg}"
   ) ((1 : Nat), [])
   pure lines.reverse.flatten
+
+def parse : String -> Except String Program := parseLines parseLine
 
 /-- A version of `parse` that runs at compile-time. -/
 elab "parse(" s:str ")" : term => do
